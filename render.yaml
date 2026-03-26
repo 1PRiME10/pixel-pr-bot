@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: pixel-pr-bot
+    runtime: node
+    # Root dir is the repo root so pnpm workspace commands work correctly
+    rootDir: .
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter @workspace/api-server run build
+    startCommand: node --enable-source-maps ./artifacts/api-server/dist/index.mjs
+    # Cache both the pnpm store and the resolved node_modules tree between deploys.
+    # This avoids re-downloading ~565 MB of packages on every push.
+    buildCacheDirectories:
+      - .pnpm-store
+      - node_modules
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: RENDER
+        value: "true"
+      # Secrets are set manually in the Render dashboard:
+      # DISCORD_TOKEN, DATABASE_URL, GOOGLE_AI_KEY, GROQ_API_KEY, TWITTER_BEARER_TOKEN

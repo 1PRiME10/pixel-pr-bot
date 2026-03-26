@@ -44,6 +44,9 @@ Thumbs.db
 .cursor/rules/nx-rules.mdc
 .github/instructions/nx.instructions.md
 
+# pnpm local store (cached on Render, should not go into git)
+.pnpm-store/
+
 # Replit
 .cache/
 .local/
