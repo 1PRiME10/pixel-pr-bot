@@ -2,7 +2,9 @@ import { GoogleGenAI } from "@google/genai";
 
 // ── Dual-key setup: use BOTH keys in round-robin to double free-tier quota ────
 // Checks multiple common variable names so either naming convention works.
-// Never use the Replit proxy base URL — returns 404 for all models.
+// Lazy init: does NOT throw at import time — the server still starts even if
+// GOOGLE_AI_KEY is absent (e.g. local dev without secrets).  The error is only
+// raised when a Gemini call is actually attempted.
 
 const key1 =
   process.env.GOOGLE_AI_KEY  ??
@@ -16,13 +18,14 @@ const _k2candidate =
 
 const key2 = _k2candidate && _k2candidate !== key1 ? _k2candidate : undefined;
 
-if (!key1 && !key2) {
-  throw new Error(
-    "No Gemini API key available. Set GOOGLE_AI_KEY in Secrets (Google AI Studio key).",
-  );
-}
+export const DUAL_KEY = !!(key2 && key2 !== key1);
 
-export const ai  = new GoogleGenAI({ apiKey: key1 ?? key2! });
-export const ai2 = key2 && key2 !== key1 ? new GoogleGenAI({ apiKey: key2 }) : null;
+// Clients are created lazily — null when no key is configured.
+// Code that calls Gemini should check `ai` is not null before using it.
+export const ai:  GoogleGenAI | null = key1 ?? key2
+  ? new GoogleGenAI({ apiKey: (key1 ?? key2)! })
+  : null;
 
-export const DUAL_KEY = !!ai2;
+export const ai2: GoogleGenAI | null = key2 && key2 !== key1
+  ? new GoogleGenAI({ apiKey: key2 })
+  : null;

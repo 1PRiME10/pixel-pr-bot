@@ -619,11 +619,32 @@ async function pollAccount(
 
   if (!tweets.length) return { newId: lastId, failCount: 0, unreachable: false };
 
+  // Safety cap: never post tweets older than 48 hours (prevents RSS flood of old posts)
+  const MAX_TWEET_AGE_MS = 48 * 60 * 60 * 1000;
+  const MAX_TWEETS_PER_POLL = 5; // safety cap — never spam more than 5 per cycle
+
+  const recentTweets = tweets.filter(t => {
+    if (!t.pubDate) return true; // no date info → include (let it through)
+    const age = Date.now() - new Date(t.pubDate).getTime();
+    return age < MAX_TWEET_AGE_MS;
+  });
+
+  // If all fetched tweets are older than 48h, it means the saved lastId is stale.
+  // Update lastId to the newest tweet we saw (to skip the backlog) but post nothing.
+  if (recentTweets.length === 0 && tweets.length > 0) {
+    const newestStale = tweets.reduce((a, b) =>
+      isNumericId(a.id) && isNumericId(b.id) && BigInt(a.id) > BigInt(b.id) ? a : b
+    );
+    const savedId = isNumericId(newestStale.id) ? newestStale.id : lastId;
+    console.log(`[TweetMonitor] @${username} — all ${tweets.length} fetched tweets are >48h old, skipping backlog, advancing lastId`);
+    return { newId: savedId, failCount: 0, unreachable: false };
+  }
+
   // Twitter API v2 with since_id already returns only new tweets.
-  // Reverse so oldest posts first (API returns newest first).
+  // Reverse so oldest posts first (API returns newest first), then cap.
   const newTweets = lastId
-    ? [...tweets].reverse()   // all are new — just reverse for chronological order
-    : [tweets[0]];            // first run: seed lastId without posting old tweets
+    ? [...recentTweets].reverse().slice(0, MAX_TWEETS_PER_POLL)
+    : [recentTweets[0]].filter(Boolean); // first run: seed lastId without posting old tweets
 
   if (!newTweets.length) return { newId: lastId, failCount: 0, unreachable: false };
 

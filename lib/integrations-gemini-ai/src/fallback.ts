@@ -72,7 +72,7 @@ export interface FallbackOptions {
   models?: readonly string[];
 }
 
-const clients = [ai, ...(ai2 ? [ai2] : [])];
+const clients = [ai, ...(ai2 ? [ai2] : [])].filter(Boolean) as import("@google/genai").GoogleGenAI[];
 
 async function tryChainOnce(opts: FallbackOptions): Promise<{ text: string | null; lastErr: unknown }> {
   const chain = opts.models ?? FALLBACK_MODELS;
