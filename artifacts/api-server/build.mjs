@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build as esbuild } from "esbuild";
 import esbuildPluginPino from "esbuild-plugin-pino";
-import { rm } from "node:fs/promises";
+import { rm, cp, mkdir } from "node:fs/promises";
 
 // Plugins (e.g. 'esbuild-plugin-pino') may use `require` to resolve dependencies
 globalThis.require = createRequire(import.meta.url);
@@ -13,6 +13,16 @@ const artifactDir = path.dirname(fileURLToPath(import.meta.url));
 async function buildAll() {
   const distDir = path.resolve(artifactDir, "dist");
   await rm(distDir, { recursive: true, force: true });
+
+  // Copy chibi images into dist/chibi/ so they travel with the bundle on every host (Render, Replit, etc.)
+  // Prefer high-quality folder (ai_hoshino_hq) over the old resized folder
+  const hqDir     = path.resolve(artifactDir, "attached_assets", "generated_images", "ai_hoshino_hq");
+  const legacyDir = path.resolve(artifactDir, "attached_assets", "generated_images", "ai_hoshino_resized");
+  const srcImages = (await import("node:fs").then(m => m.existsSync(hqDir))) ? hqDir : legacyDir;
+  const dstImages = path.resolve(distDir, "chibi");
+  await mkdir(dstImages, { recursive: true });
+  await cp(srcImages, dstImages, { recursive: true });
+  console.log(`[build] Copied chibi images → dist/chibi/`);
 
   await esbuild({
     entryPoints: [path.resolve(artifactDir, "src/index.ts")],
@@ -64,7 +74,6 @@ async function buildAll() {
       "@azure/*",
       "@opentelemetry/*",
       "@google-cloud/*",
-      "@google/*",
       "googleapis",
       "firebase-admin",
       "@parcel/watcher",
@@ -100,6 +109,11 @@ async function buildAll() {
       "puppeteer",
       "puppeteer-core",
       "electron",
+      "shoukaku",
+      "@discordjs/voice",
+      "opusscript",
+      "play-dl",
+      "ffmpeg-static",
     ],
     sourcemap: "linked",
     plugins: [
