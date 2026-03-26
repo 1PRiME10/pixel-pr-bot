@@ -149,6 +149,12 @@ const GRAPHQL_TWEET_FEATURES = {
   responsive_web_enhance_cards_enabled: false,
 };
 
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'");
+}
+
 function extractTweetsFromGraphQLResponse(data: any, username: string): Tweet[] {
   const instructions = data?.data?.user?.result?.timeline_v2?.timeline?.instructions;
   if (!Array.isArray(instructions)) return [];
@@ -169,26 +175,60 @@ function extractTweetsFromGraphQLResponse(data: any, username: string): Tweet[] 
     if (!legacy?.id_str || !legacy?.full_text) continue;
 
     const authorLegacy = tweetResult?.core?.user_results?.result?.legacy ?? {};
-    const authorName = (authorLegacy?.name as string | undefined) ?? username;
+    const authorScreenName: string = (authorLegacy?.screen_name as string | undefined) ?? username;
+    const authorName: string = (authorLegacy?.name as string | undefined) ?? username;
 
-    // Extract first image from extended_entities (preferred) or entities
-    const media: any[] = legacy?.extended_entities?.media ?? legacy?.entities?.media ?? [];
-    const imageUrl = (media[0]?.media_url_https as string | undefined);
+    // ── Retweet handling ──────────────────────────────────────────────────────
+    // For retweets, use the ORIGINAL tweet's author+ID for the URL.
+    // Linking to the RT status URL causes "Cannot retrieve posts at this time"
+    // on X because retweet status pages redirect unpredictably.
+    const isRetweet = (legacy.full_text as string).startsWith("RT @");
+    const rtResult = legacy?.retweeted_status_result?.result ?? tweetResult?.retweeted_status_result?.result;
+    const rtLegacy = rtResult?.legacy ?? rtResult?.tweet?.legacy;
+    const rtAuthorLegacy = rtResult?.core?.user_results?.result?.legacy ?? {};
 
-    const rawText = (legacy.full_text as string)
-      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-      .replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    let tweetId: string;
+    let tweetUrl: string;
+    let displayText: string;
+    let imageUrl: string | undefined;
+
+    if (isRetweet && rtLegacy?.id_str) {
+      // Use original tweet's screen_name and ID so the link always resolves
+      const rtScreenName: string = (rtAuthorLegacy?.screen_name as string | undefined)
+        ?? extractRtUsername(legacy.full_text as string)
+        ?? authorScreenName;
+      tweetId  = legacy.id_str as string;           // keep RT id for deduplication
+      tweetUrl = `https://x.com/${rtScreenName}/status/${rtLegacy.id_str}`;
+      // Show full original text, not the truncated "RT @user: …" version
+      const fullRtText = (rtLegacy.full_text as string | undefined) ?? (legacy.full_text as string);
+      displayText = `🔁 RT @${rtScreenName}\n${decodeEntities(fullRtText)}`;
+      const rtMedia: any[] = rtLegacy?.extended_entities?.media ?? rtLegacy?.entities?.media ?? [];
+      imageUrl = rtMedia[0]?.media_url_https as string | undefined;
+    } else {
+      // Regular tweet or quote tweet — link directly to the tweet
+      tweetId  = legacy.id_str as string;
+      tweetUrl = `https://x.com/${authorScreenName}/status/${legacy.id_str}`;
+      displayText = decodeEntities(legacy.full_text as string);
+      const media: any[] = legacy?.extended_entities?.media ?? legacy?.entities?.media ?? [];
+      imageUrl = media[0]?.media_url_https as string | undefined;
+    }
 
     tweets.push({
-      id: legacy.id_str as string,
-      text: rawText,
+      id: tweetId,
+      text: displayText,
       author: authorName,
-      url: `https://x.com/${username}/status/${legacy.id_str}`,
+      url: tweetUrl,
       pubDate: (legacy.created_at as string) ?? "",
       imageUrl,
     });
   }
   return tweets;
+}
+
+/** Extract @username from "RT @username: …" text */
+function extractRtUsername(text: string): string | null {
+  const m = text.match(/^RT @([A-Za-z0-9_]+):/);
+  return m ? m[1] : null;
 }
 
 async function fetchViaTwitterGraphQL(
@@ -315,11 +355,15 @@ function parseRssXml(xml: string, username: string): Tweet[] {
   const tweets: Tweet[] = [];
 
   for (const item of items) {
-    // Extract status URL and tweet ID
-    const linkMatch = item.match(/<link>(?:<!\[CDATA\[)?(https?:\/\/[^<]+?\/status\/(\d+)[^<]*)(?:\]\]>)?<\/link>/);
+    // Extract status URL and tweet ID.
+    // Nitter RSS link format: https://nitter.host/OriginalAuthor/status/ID
+    // For retweets, the link already points to the ORIGINAL tweet author — use it directly.
+    const linkMatch = item.match(/<link>(?:<!\[CDATA\[)?(https?:\/\/[^<]+?\/([A-Za-z0-9_]+)\/status\/(\d+)[^<]*)(?:\]\]>)?<\/link>/);
     if (!linkMatch) continue;
-    const tweetId  = linkMatch[2]!;
-    const tweetUrl = `https://x.com/${username}/status/${tweetId}`;
+    const linkAuthor = linkMatch[2]!;   // may be original author (for retweets)
+    const tweetId    = linkMatch[3]!;
+    // Always point to x.com with the author from the RSS link (correct for both tweets and RTs)
+    const tweetUrl = `https://x.com/${linkAuthor}/status/${tweetId}`;
 
     // Extract text from <title> — Nitter/RSSHub format: "@user: tweet text"
     const titleMatch = item.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/);
