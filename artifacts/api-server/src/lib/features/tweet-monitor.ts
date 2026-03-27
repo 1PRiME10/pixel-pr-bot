@@ -79,7 +79,8 @@ const TWITTER_WEB_BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xn
 // Try in order; if a query ID returns 403/404 Twitter has rotated it.
 const USER_BY_SCREEN_NAME_QID = "oUZZZ8Oddwxs8Cd3iW3UEA"; // confirmed 2026-03-26
 const USER_TWEETS_QIDS = [
-  "V1ze5q3ijDS1VeLwLY0m7g", // confirmed 2026-03-26
+  "V1ze5q3ijDS1VeLwLY0m7g", // UserTweets (Posts tab)  — confirmed 2026-03-26
+  "FOlovQsiHGDls3c0Q_HaSQ", // UserTweets (profileBestHighlights) — confirmed 2026-03-27
   "XicnWRbyQ3WgVlwd5MedHA", // fallback #1
   "H8OjuYEErBMQam1dmf9-iA", // fallback #2
 ];
@@ -87,12 +88,55 @@ const USER_TWEETS_QIDS = [
 // In-memory user-ID cache for GraphQL lookups (user IDs never change)
 const graphqlUserIdCache = new Map<string, string>();
 
-function twitterWebHeaders(): Record<string, string> {
+/** Seed an already-known Twitter user_id into cache + DB — call from twitterpoll or admin commands */
+export async function cacheTwitterUserId(username: string, userId: string): Promise<void> {
+  graphqlUserIdCache.set(username.toLowerCase(), userId);
+  await pool.query(
+    `UPDATE tweet_monitors SET twitter_user_id = $1 WHERE twitter_user = $2`,
+    [userId, username],
+  ).catch(() => {});
+}
+
+// ─── Guest token — required by Twitter GraphQL from cloud IPs ─────────────────
+// Without x-guest-token the GraphQL endpoints return 403 from non-browser IPs.
+// Guest tokens are valid ~3 hours; we refresh them every 90 minutes proactively.
+let cachedGuestToken: string | null = null;
+let guestTokenFetchedAt = 0;
+
+async function refreshGuestToken(): Promise<string> {
+  const resp = await fetch("https://api.twitter.com/1.1/guest/activate.json", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TWITTER_WEB_BEARER}` },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!resp.ok) throw new Error(`Guest token HTTP ${resp.status}`);
+  const data = await resp.json() as { guest_token?: string };
+  if (!data.guest_token) throw new Error("No guest_token in response");
+  console.log("[TweetMonitor] 🔑 Guest token refreshed");
+  return data.guest_token;
+}
+
+async function getGuestToken(): Promise<string> {
+  const now = Date.now();
+  if (cachedGuestToken && now - guestTokenFetchedAt < 90 * 60_000) return cachedGuestToken;
+  cachedGuestToken = await refreshGuestToken();
+  guestTokenFetchedAt = now;
+  return cachedGuestToken;
+}
+
+async function twitterWebHeaders(): Promise<Record<string, string>> {
+  const guestToken = await getGuestToken();
   return {
     Authorization: `Bearer ${TWITTER_WEB_BEARER}`,
+    "x-guest-token": guestToken,
+    "x-csrf-token": "0",
     "x-twitter-active-user": "yes",
     "x-twitter-client-language": "en",
+    "x-twitter-auth-type": "OAuth2Client",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://twitter.com/",
+    "Origin": "https://twitter.com",
   };
 }
 
@@ -113,8 +157,12 @@ async function resolveUserIdViaGraphQL(username: string): Promise<string> {
 
   const vars = encodeURIComponent(JSON.stringify({ screen_name: username, withSafetyModeUserFields: true }));
   const url = `https://api.twitter.com/graphql/${USER_BY_SCREEN_NAME_QID}/UserByScreenName?variables=${vars}&features=%7B%22hidden_profile_likes_enabled%22%3Atrue%7D`;
-  const resp = await fetch(url, { headers: twitterWebHeaders(), signal: AbortSignal.timeout(10_000) });
-  if (!resp.ok) throw new Error(`UserByScreenName HTTP ${resp.status}`);
+  const resp = await fetch(url, { headers: await twitterWebHeaders(), signal: AbortSignal.timeout(10_000) });
+  if (!resp.ok) {
+    if (resp.status === 401 || resp.status === 403) cachedGuestToken = null; // force refresh
+    const body = await resp.text().catch(() => "");
+    throw new Error(`UserByScreenName HTTP ${resp.status}: ${body.slice(0, 150)}`);
+  }
   const data = await resp.json() as { data?: { user?: { result?: { rest_id?: string } } } };
   const userId = data?.data?.user?.result?.rest_id;
   if (!userId) throw new Error(`Could not resolve user ID for @${username} via GraphQL`);
@@ -149,14 +197,11 @@ const GRAPHQL_TWEET_FEATURES = {
   responsive_web_enhance_cards_enabled: false,
 };
 
-function decodeEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'");
-}
-
 function extractTweetsFromGraphQLResponse(data: any, username: string): Tweet[] {
-  const instructions = data?.data?.user?.result?.timeline_v2?.timeline?.instructions;
+  // Twitter uses either timeline_v2 (Posts tab) or timeline (profileBestHighlights) depending on the QID
+  const instructions =
+    data?.data?.user?.result?.timeline_v2?.timeline?.instructions ??
+    data?.data?.user?.result?.timeline?.timeline?.instructions;
   if (!Array.isArray(instructions)) return [];
 
   // The entries live either in a TimelineAddEntries instruction or directly as `entries`
@@ -175,60 +220,26 @@ function extractTweetsFromGraphQLResponse(data: any, username: string): Tweet[] 
     if (!legacy?.id_str || !legacy?.full_text) continue;
 
     const authorLegacy = tweetResult?.core?.user_results?.result?.legacy ?? {};
-    const authorScreenName: string = (authorLegacy?.screen_name as string | undefined) ?? username;
-    const authorName: string = (authorLegacy?.name as string | undefined) ?? username;
+    const authorName = (authorLegacy?.name as string | undefined) ?? username;
 
-    // ── Retweet handling ──────────────────────────────────────────────────────
-    // For retweets, use the ORIGINAL tweet's author+ID for the URL.
-    // Linking to the RT status URL causes "Cannot retrieve posts at this time"
-    // on X because retweet status pages redirect unpredictably.
-    const isRetweet = (legacy.full_text as string).startsWith("RT @");
-    const rtResult = legacy?.retweeted_status_result?.result ?? tweetResult?.retweeted_status_result?.result;
-    const rtLegacy = rtResult?.legacy ?? rtResult?.tweet?.legacy;
-    const rtAuthorLegacy = rtResult?.core?.user_results?.result?.legacy ?? {};
+    // Extract first image from extended_entities (preferred) or entities
+    const media: any[] = legacy?.extended_entities?.media ?? legacy?.entities?.media ?? [];
+    const imageUrl = (media[0]?.media_url_https as string | undefined);
 
-    let tweetId: string;
-    let tweetUrl: string;
-    let displayText: string;
-    let imageUrl: string | undefined;
-
-    if (isRetweet && rtLegacy?.id_str) {
-      // Use original tweet's screen_name and ID so the link always resolves
-      const rtScreenName: string = (rtAuthorLegacy?.screen_name as string | undefined)
-        ?? extractRtUsername(legacy.full_text as string)
-        ?? authorScreenName;
-      tweetId  = legacy.id_str as string;           // keep RT id for deduplication
-      tweetUrl = `https://x.com/${rtScreenName}/status/${rtLegacy.id_str}`;
-      // Show full original text, not the truncated "RT @user: …" version
-      const fullRtText = (rtLegacy.full_text as string | undefined) ?? (legacy.full_text as string);
-      displayText = `🔁 RT @${rtScreenName}\n${decodeEntities(fullRtText)}`;
-      const rtMedia: any[] = rtLegacy?.extended_entities?.media ?? rtLegacy?.entities?.media ?? [];
-      imageUrl = rtMedia[0]?.media_url_https as string | undefined;
-    } else {
-      // Regular tweet or quote tweet — link directly to the tweet
-      tweetId  = legacy.id_str as string;
-      tweetUrl = `https://x.com/${authorScreenName}/status/${legacy.id_str}`;
-      displayText = decodeEntities(legacy.full_text as string);
-      const media: any[] = legacy?.extended_entities?.media ?? legacy?.entities?.media ?? [];
-      imageUrl = media[0]?.media_url_https as string | undefined;
-    }
+    const rawText = (legacy.full_text as string)
+      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 
     tweets.push({
-      id: tweetId,
-      text: displayText,
+      id: legacy.id_str as string,
+      text: rawText,
       author: authorName,
-      url: tweetUrl,
+      url: `https://x.com/${username}/status/${legacy.id_str}`,
       pubDate: (legacy.created_at as string) ?? "",
       imageUrl,
     });
   }
   return tweets;
-}
-
-/** Extract @username from "RT @username: …" text */
-function extractRtUsername(text: string): string | null {
-  const m = text.match(/^RT @([A-Za-z0-9_]+):/);
-  return m ? m[1] : null;
 }
 
 async function fetchViaTwitterGraphQL(
@@ -250,12 +261,17 @@ async function fetchViaTwitterGraphQL(
     const url = `https://api.twitter.com/graphql/${queryId}/UserTweets?variables=${encodeURIComponent(JSON.stringify(tweetVars))}&features=${encodeURIComponent(JSON.stringify(GRAPHQL_TWEET_FEATURES))}`;
     let resp: Response;
     try {
-      resp = await fetch(url, { headers: twitterWebHeaders(), signal: AbortSignal.timeout(12_000) });
+      resp = await fetch(url, { headers: await twitterWebHeaders(), signal: AbortSignal.timeout(12_000) });
     } catch (e: any) {
       errors.push(`${queryId}: ${e.message}`);
       continue;
     }
-    if (!resp.ok) { errors.push(`${queryId}: HTTP ${resp.status}`); continue; }
+    if (!resp.ok) {
+      if (resp.status === 401 || resp.status === 403) cachedGuestToken = null;
+      const body = await resp.text().catch(() => "");
+      errors.push(`${queryId}: HTTP ${resp.status} — ${body.slice(0, 120)}`);
+      continue;
+    }
 
     const data = await resp.json();
     const tweets = extractTweetsFromGraphQLResponse(data, username);
@@ -293,6 +309,7 @@ export async function initTweetMonitor(): Promise<void> {
   await pool.query(`ALTER TABLE tweet_monitors ADD COLUMN IF NOT EXISTS last_fail_at TIMESTAMPTZ`).catch(() => {});
   await pool.query(`ALTER TABLE tweet_monitors ADD COLUMN IF NOT EXISTS unreachable BOOLEAN NOT NULL DEFAULT FALSE`).catch(() => {});
   await pool.query(`ALTER TABLE tweet_monitors ADD COLUMN IF NOT EXISTS twitter_user_id TEXT`).catch(() => {});
+  await pool.query(`ALTER TABLE tweet_monitors ADD COLUMN IF NOT EXISTS last_error TEXT`).catch(() => {});
 
   // On startup: reset ALL non-permanently-unreachable accounts so they get
   // a fresh attempt on the first poll cycle after restart.
@@ -355,15 +372,11 @@ function parseRssXml(xml: string, username: string): Tweet[] {
   const tweets: Tweet[] = [];
 
   for (const item of items) {
-    // Extract status URL and tweet ID.
-    // Nitter RSS link format: https://nitter.host/OriginalAuthor/status/ID
-    // For retweets, the link already points to the ORIGINAL tweet author — use it directly.
-    const linkMatch = item.match(/<link>(?:<!\[CDATA\[)?(https?:\/\/[^<]+?\/([A-Za-z0-9_]+)\/status\/(\d+)[^<]*)(?:\]\]>)?<\/link>/);
+    // Extract status URL and tweet ID
+    const linkMatch = item.match(/<link>(?:<!\[CDATA\[)?(https?:\/\/[^<]+?\/status\/(\d+)[^<]*)(?:\]\]>)?<\/link>/);
     if (!linkMatch) continue;
-    const linkAuthor = linkMatch[2]!;   // may be original author (for retweets)
-    const tweetId    = linkMatch[3]!;
-    // Always point to x.com with the author from the RSS link (correct for both tweets and RTs)
-    const tweetUrl = `https://x.com/${linkAuthor}/status/${tweetId}`;
+    const tweetId  = linkMatch[2]!;
+    const tweetUrl = `https://x.com/${username}/status/${tweetId}`;
 
     // Extract text from <title> — Nitter/RSSHub format: "@user: tweet text"
     const titleMatch = item.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/);
@@ -432,6 +445,11 @@ async function fetchViaRss(username: string): Promise<{ tweets: Tweet[]; source:
     const result = await Promise.any(
       batch.map(({ type, host }) =>
         trySingleRssSource(type, host, username).then(r => {
+          // Treat 0 tweets as failure (e.g. xcancel whitelist page, empty channel)
+          if (!r.tweets.length) {
+            errors.push(`${host}: returned 0 tweets (whitelist/empty)`);
+            return Promise.reject(new Error("0 tweets"));
+          }
           console.log(`[TweetMonitor] @${username} ✓ via ${r.source} — ${r.tweets.length} tweet(s)`);
           return r;
         }).catch(e => { errors.push(`${host}: ${e.message}`); return Promise.reject(e); })
@@ -442,6 +460,65 @@ async function fetchViaRss(username: string): Promise<{ tweets: Tweet[]; source:
   }
 
   throw new Error(`All RSS sources failed for @${username}. Errors: ${errors.slice(0, 3).join(" | ")}`);
+}
+
+// ─── Proxy fetch — routes through Replit (its IPs are NOT blocked by Twitter) ─
+// Set TWITTER_PROXY_URL=https://<replit-domain>/proxy/twitter on Render.
+// Set TWITTER_PROXY_SECRET=<secret> on BOTH Render and the Replit deployment.
+async function fetchViaProxy(
+  username: string,
+  sinceId?: string | null,
+): Promise<{ tweets: Tweet[]; source: string }> {
+  const proxyUrl = process.env.TWITTER_PROXY_URL;
+  const secret   = process.env.TWITTER_PROXY_SECRET;
+  if (!proxyUrl || !secret) throw new Error("TWITTER_PROXY_URL or TWITTER_PROXY_SECRET not set");
+
+  const url = new URL(proxyUrl);
+  url.searchParams.set("username", username);
+  if (sinceId) url.searchParams.set("since_id", sinceId);
+
+  // Pass cached user_id so the Worker can skip UserByScreenName (which gets 400 from Cloudflare IPs)
+  const cachedId = graphqlUserIdCache.get(username.toLowerCase());
+  if (cachedId) {
+    url.searchParams.set("user_id", cachedId);
+  } else {
+    const dbRes = await pool.query(
+      `SELECT twitter_user_id FROM tweet_monitors WHERE twitter_user = $1 AND twitter_user_id IS NOT NULL LIMIT 1`,
+      [username],
+    ).catch(() => null);
+    if (dbRes?.rows[0]?.twitter_user_id) {
+      url.searchParams.set("user_id", dbRes.rows[0].twitter_user_id as string);
+    }
+  }
+
+  const resp = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${secret}`,
+      "User-Agent":  "PIXEL_PR_Bot/2.0 (Render->CF proxy)",
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Proxy HTTP ${resp.status}: ${body.slice(0, 150)}`);
+  }
+
+  const data = await resp.json() as { tweets?: Tweet[]; source?: string; error?: string; userId?: string };
+  if (data.error) throw new Error(`Proxy returned error: ${data.error}`);
+  if (!Array.isArray(data.tweets)) throw new Error("Proxy: unexpected response format");
+
+  // Cache the userId returned by the Worker so future calls skip UserByScreenName entirely
+  if (data.userId) {
+    graphqlUserIdCache.set(username.toLowerCase(), data.userId);
+    pool.query(
+      `UPDATE tweet_monitors SET twitter_user_id = $1 WHERE twitter_user = $2 AND twitter_user_id IS NULL`,
+      [data.userId, username],
+    ).catch(() => {});
+  }
+
+  console.log(`[TweetMonitor] @${username} ✓ via proxy (${data.source}) — ${data.tweets.length} tweet(s)`);
+  return { tweets: data.tweets, source: `proxy:${data.source ?? "?"}` };
 }
 
 // ── Fetch via Twitter API v2 (requires Basic/Pro plan for reading others' tweets) ──
@@ -519,11 +596,107 @@ async function fetchViaTwitterApiV2(
   return { tweets, source: "twitter-api-v2" };
 }
 
-// ── Public entry — priority: Twitter API v2 → GraphQL guest → Nitter RSS ─────
+// ─── Twitter Syndication API ─────────────────────────────────────────────────
+// This is Twitter's official embedded-timeline API used by platform.twitter.com.
+// It serves any public IP (including Render cloud IPs) because websites embed it
+// server-side. No auth required.
+// URL: https://syndication.twitter.com/srv/timeline-profile/screen-name/{user}
+// Response: HTML page with <script id="__NEXT_DATA__"> containing JSON tweet data.
+async function fetchViaSyndication(
+  username: string,
+  sinceId?: string | null,
+): Promise<{ tweets: Tweet[]; source: string }> {
+  const url =
+    `https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(username)}` +
+    `?count=20&lang=en&dnt=1`;
+
+  const resp = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://publish.twitter.com/",
+    },
+    signal: AbortSignal.timeout(12_000),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`Syndication HTTP ${resp.status}: ${body.slice(0, 150)}`);
+  }
+
+  const html = await resp.text();
+
+  // Extract __NEXT_DATA__ JSON blob embedded in the page
+  const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!match) throw new Error("Syndication: __NEXT_DATA__ not found in response");
+
+  let nextData: any;
+  try { nextData = JSON.parse(match[1]!); } catch { throw new Error("Syndication: __NEXT_DATA__ JSON parse error"); }
+
+  // Timeline entries live at props.pageProps.timeline.entries
+  const entries: any[] =
+    nextData?.props?.pageProps?.timeline?.entries ??
+    nextData?.props?.pageProps?.timeline?.timeline?.entries ??
+    [];
+
+  if (!entries.length) throw new Error("Syndication: no entries in timeline");
+
+  const tweets: Tweet[] = [];
+  for (const entry of entries) {
+    const raw = entry?.tweet ?? entry?.content?.tweet ?? entry;
+    if (!raw?.id_str || !raw?.full_text) continue;
+
+    const text = (raw.full_text as string)
+      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+
+    const author = (raw.user?.name as string | undefined) ?? username;
+    const imageUrl: string | undefined = raw.entities?.media?.[0]?.media_url_https
+      ?? raw.extended_entities?.media?.[0]?.media_url_https;
+
+    tweets.push({
+      id:        raw.id_str as string,
+      text,
+      author,
+      url:       `https://x.com/${username}/status/${raw.id_str}`,
+      pubDate:   raw.created_at ?? "",
+      imageUrl,
+    });
+  }
+
+  if (!tweets.length) throw new Error("Syndication: parsed 0 tweets from timeline");
+
+  const filtered =
+    sinceId && isNumericId(sinceId)
+      ? tweets.filter(t => isNumericId(t.id) && BigInt(t.id) > BigInt(sinceId))
+      : tweets;
+
+  console.log(`[TweetMonitor] @${username} ✓ via syndication — ${filtered.length}/${tweets.length} tweet(s)`);
+  return { tweets: filtered, source: "twitter:syndication" };
+}
+
+// ── Public entry — priority: Proxy → Twitter API v2 → GraphQL guest → Nitter RSS ──
 export async function fetchLatestTweets(
   username: string,
   sinceId?: string | null,
 ): Promise<{ tweets: Tweet[]; source: string }> {
+  // 0. Proxy (Cloudflare Worker → bypasses Render IP blocks). Enabled only when TWITTER_PROXY_URL is set.
+  if (process.env.TWITTER_PROXY_URL) {
+    try {
+      const proxyResult = await fetchViaProxy(username, sinceId);
+      // If proxy returned tweets, we're done.
+      // If 0 tweets: fall through to syndication — the guest-token UserTweets API silently
+      // returns empty for small/new accounts (e.g. @1prime10) even when tweets exist.
+      // Syndication handles sinceId filtering client-side so no duplicate posts occur.
+      if (proxyResult.tweets.length > 0) return proxyResult;
+      console.warn(`[TweetMonitor] @${username} — Proxy returned 0 tweets, falling through to syndication`);
+    } catch (err: any) {
+      console.warn(`[TweetMonitor] @${username} — Proxy failed (${err.message}), trying direct GraphQL`);
+    }
+  }
+
   // 1. Twitter API v2 (requires paid bearer token — most reliable if available)
   const token = getBearerToken();
   if (token) {
@@ -535,14 +708,21 @@ export async function fetchLatestTweets(
   }
 
   // 2. Twitter GraphQL guest API (free, no key needed — uses same bearer as twitter.com web app)
-  //    NOTE: rss.xcancel.com now requires whitelisting, so GraphQL is our primary free path.
+  //    NOTE: blocked from Render/cloud IPs; works from Replit IPs (used by proxy endpoint).
   try {
     return await fetchViaTwitterGraphQL(username, sinceId);
   } catch (err: any) {
-    console.warn(`[TweetMonitor] @${username} — Twitter GraphQL failed (${err.message}), falling back to Nitter RSS`);
+    console.warn(`[TweetMonitor] @${username} — Twitter GraphQL failed (${err.message}), falling back to syndication`);
   }
 
-  // 3. Nitter/RSSHub RSS (last resort — most public instances are dead/blocked as of 2026-03)
+  // 3. Twitter Syndication API (embedded-timeline endpoint — works from cloud IPs)
+  try {
+    return await fetchViaSyndication(username, sinceId);
+  } catch (err: any) {
+    console.warn(`[TweetMonitor] @${username} — Syndication failed (${err.message}), falling back to Nitter RSS`);
+  }
+
+  // 4. Nitter/RSSHub RSS (last resort — most public instances are dead/blocked as of 2026-03)
   const { tweets, source } = await fetchViaRss(username);
   if (sinceId && isNumericId(sinceId)) {
     const filtered = tweets.filter(t => isNumericId(t.id) && BigInt(t.id) > BigInt(sinceId));
@@ -583,6 +763,165 @@ export function buildTweetButton(tweetUrl: string): ActionRowBuilder<ButtonBuild
       .setURL(tweetUrl)
       .setEmoji("🐦")
   );
+}
+
+// ─── Poll one username for one guild ─────────────────────────────────────────
+async function pollAccount(
+  client: Client,
+  guildId: string,
+  channelId: string,
+  username: string,
+  lastId: string | null,
+  failCount: number,
+  lastFailAt: Date | null,
+  unreachable: boolean,
+  cachedFetch?: { tweets: Tweet[]; source: string } | Error,
+): Promise<{ newId: string | null; failCount: number; unreachable: boolean }> {
+
+  // Skip unreachable accounts entirely
+  if (unreachable) return { newId: lastId, failCount, unreachable: true };
+
+  // Slow-retry: if failing consistently, check only once every SLOW_RETRY_INTERVAL_MS (6 h)
+  if (failCount >= FAILURE_THRESHOLD && lastFailAt) {
+    const msSinceFail = Date.now() - lastFailAt.getTime();
+    if (msSinceFail < SLOW_RETRY_INTERVAL_MS) {
+      return { newId: lastId, failCount, unreachable: false }; // skip this cycle
+    }
+  }
+
+  let tweets: Tweet[];
+  let source = "unknown";
+  try {
+    if (cachedFetch) {
+      // Use pre-fetched result — cache was fetched with the minimum sinceId across guilds,
+      // so we must filter down to THIS guild's lastId before posting.
+      if (cachedFetch instanceof Error) throw cachedFetch;
+      const raw = cachedFetch.tweets;
+      tweets = (lastId && isNumericId(lastId))
+        ? raw.filter(t => isNumericId(t.id) && BigInt(t.id) > BigInt(lastId))
+        : raw;
+      source = cachedFetch.source;
+    } else {
+      const result = await fetchLatestTweets(username, lastId);
+      tweets = result.tweets;
+      source = result.source;
+    }
+    console.log(`[TweetMonitor] @${username} ✓ via ${source} (${tweets.length} tweet(s) fetched)`);
+  } catch (err: any) {
+    const errMsg = String(err?.message ?? err).slice(0, 300);
+    const newFailCount = failCount + 1;
+    const nowUnreachable = newFailCount >= DEAD_THRESHOLD;
+
+    // Always log the actual error so it's visible in logs
+    console.error(`[TweetMonitor] @${username} poll failed (attempt ${newFailCount}): ${errMsg}`);
+
+    await pool.query(
+      `UPDATE tweet_monitors SET fail_count = $1, last_fail_at = NOW(), unreachable = $2, last_error = $5
+       WHERE guild_id = $3 AND twitter_user = $4`,
+      [newFailCount, nowUnreachable, guildId, username, errMsg]
+    );
+
+    if (newFailCount === FAILURE_THRESHOLD) {
+      console.warn(`[TweetMonitor] @${username} — switching to hourly retry after ${newFailCount} failures`);
+    }
+
+    if (nowUnreachable) {
+      console.warn(`[TweetMonitor] @${username} marked unreachable after ${newFailCount} failures`);
+      // Notify the monitor channel — fetch from API if not in cache (post-restart safe)
+      const channel = (
+        client.channels.cache.get(channelId) ??
+        await client.channels.fetch(channelId).catch(() => null)
+      ) as TextChannel | null;
+      if (channel) {
+        await channel.send(
+          `⚠️ **Twitter/X Monitor**: Could not reach **@${username}** after ${newFailCount} attempts.\n` +
+          `This account may be **private**, **suspended**, or the RSS feed is permanently blocked.\n` +
+          `Use \`!removetwitter @${username}\` to stop monitoring it, or \`!twittercheck @${username}\` to retry manually.`
+        ).catch(() => {});
+      }
+    }
+
+    return { newId: lastId, failCount: newFailCount, unreachable: nowUnreachable };
+  }
+
+  // Success — reset fail count
+  if (failCount > 0) {
+    await pool.query(
+      `UPDATE tweet_monitors SET fail_count = 0, last_fail_at = NULL, unreachable = FALSE
+       WHERE guild_id = $1 AND twitter_user = $2`,
+      [guildId, username]
+    );
+  }
+
+  if (!tweets.length) return { newId: lastId, failCount: 0, unreachable: false };
+
+  // Sort tweets newest-first by ID (API may return mixed order, especially with highlights QID)
+  tweets.sort((a, b) => {
+    if (!isNumericId(a.id) || !isNumericId(b.id)) return 0;
+    return BigInt(b.id) > BigInt(a.id) ? 1 : -1;
+  });
+
+  // ── First run (no lastId): seed the tracker with the newest tweet ID without posting.
+  // This prevents blasting old tweets into Discord when a new account is added.
+  if (!lastId) {
+    const seed = tweets[0];
+    const seedId = seed && isNumericId(seed.id) ? seed.id : null;
+    return { newId: seedId, failCount: 0, unreachable: false };
+  }
+
+  // ── Subsequent runs: age-filter + cap to avoid flooding ──────────────────────
+  // Only send tweets published in the last 48 hours.
+  // Tweets without a pubDate are skipped (cannot verify age — conservative).
+  const MAX_TWEET_AGE_MS    = 48 * 60 * 60 * 1000; // 48 h
+  const MAX_TWEETS_PER_POLL = 3;                    // cap per poll cycle
+
+  const freshTweets = tweets.filter(t => {
+    if (!t.pubDate) return false;
+    const age = Date.now() - new Date(t.pubDate).getTime();
+    return !isNaN(age) && age < MAX_TWEET_AGE_MS;
+  });
+
+  if (!freshTweets.length) {
+    // All tweets are stale — advance lastId to the newest to avoid re-checking next cycle.
+    const newestId = tweets[0] && isNumericId(tweets[0].id) ? tweets[0].id : lastId;
+    return { newId: newestId, failCount: 0, unreachable: false };
+  }
+
+  // Reverse to post oldest-first, cap to MAX_TWEETS_PER_POLL
+  const newTweets = [...freshTweets].reverse().slice(0, MAX_TWEETS_PER_POLL);
+
+  // Fetch channel from Discord API if not in cache (common after restarts — cache is empty).
+  // Silently dropping tweets when the channel isn't cached was the root cause of missed posts.
+  const channel = (
+    client.channels.cache.get(channelId) ??
+    await client.channels.fetch(channelId).catch(() => null)
+  ) as TextChannel | null;
+  if (!channel) {
+    console.warn(`[TweetMonitor] @${username} — channel ${channelId} not found (deleted?), skipping`);
+    return { newId: lastId, failCount: 0, unreachable: false };
+  }
+
+  // Track the last tweet that was SUCCESSFULLY sent — so a failed send is retried next poll
+  // rather than being silently skipped forever.
+  let lastSuccessfullySentId: string | null = null;
+
+  for (const tweet of newTweets) {
+    try {
+      await channel.send({
+        embeds: [buildTweetEmbed(tweet, username)],
+        components: [buildTweetButton(tweet.url)],
+      });
+      lastSuccessfullySentId = tweet.id;
+    } catch (e: any) {
+      console.warn(`[TweetMonitor] @${username} — failed to send tweet ${tweet.id}: ${e?.message ?? e}`);
+    }
+  }
+
+  // Only advance last_tweet_id to the last tweet that actually reached Discord.
+  // If ALL sends failed, keep lastId so every tweet is retried next cycle.
+  const sentId = lastSuccessfullySentId ?? null;
+  const savedId = sentId && isNumericId(sentId) ? sentId : lastId;
+  return { newId: savedId, failCount: 0, unreachable: false };
 }
 
 // ─── Polling loop ─────────────────────────────────────────────────────────────
@@ -639,166 +978,75 @@ async function runPollCycle(client: Client): Promise<void> {
       return;
     }
 
-    // ── Deduplicate by username ───────────────────────────────────────────────
-    // If the same Twitter account is monitored in multiple guilds/channels, we
-    // only call the GraphQL / RSS API ONCE per username per cycle.  Results are
-    // shared across all rows that match the username, drastically cutting HTTP
-    // requests and CPU pressure (which was causing false-positive watchdog
-    // reconnects and "The application did not respond" errors).
+    // ── Phase 1: fetch each unique username ONCE with 2 s stagger ──────────────
+    // Avoids N×guilds HTTP requests when the same account is monitored in multiple servers.
+    const uniqueUsernames = [
+      ...new Set(
+        rows
+          .filter(r => !r.unreachable)
+          .filter(r => !(
+            r.fail_count >= FAILURE_THRESHOLD &&
+            r.last_fail_at &&
+            Date.now() - r.last_fail_at.getTime() < SLOW_RETRY_INTERVAL_MS
+          ))
+          .map(r => r.twitter_user),
+      ),
+    ];
+
+    // Compute the minimum (oldest) sinceId per username across all guilds.
+    // Fetching with the oldest sinceId captures new tweets for every guild;
+    // each guild then re-filters to its own lastId inside pollAccount.
+    const minSinceId = new Map<string, string | null>();
+    for (const row of rows.filter(r => uniqueUsernames.includes(r.twitter_user))) {
+      const u  = row.twitter_user;
+      const id = row.last_tweet_id;
+      if (!minSinceId.has(u)) {
+        minSinceId.set(u, id);
+      } else {
+        const cur = minSinceId.get(u)!;
+        if (cur === null || id === null) {
+          minSinceId.set(u, null);                                            // any null → fetch all
+        } else if (isNumericId(cur) && isNumericId(id) && BigInt(id) < BigInt(cur)) {
+          minSinceId.set(u, id);                                              // keep the older one
+        }
+      }
+    }
+
     const fetchCache = new Map<string, { tweets: Tweet[]; source: string } | Error>();
-
-    // Collect unique usernames in the order they appear (skip unreachable / slow-retry).
-    const uniqueUsernames: string[] = [];
-    for (const row of rows) {
-      const u = row.twitter_user;
-      if (fetchCache.has(u)) continue;              // already queued
-      if (row.unreachable) {
-        fetchCache.set(u, new Error("unreachable")); // sentinel — skip silently
-        continue;
-      }
-      if (row.fail_count >= FAILURE_THRESHOLD && row.last_fail_at) {
-        const msSinceFail = Date.now() - new Date(row.last_fail_at).getTime();
-        if (msSinceFail < SLOW_RETRY_INTERVAL_MS) {
-          fetchCache.set(u, new Error("slow-retry"));
-          continue;
-        }
-      }
-      fetchCache.set(u, new Error("pending")); // placeholder so it's not re-queued
-      uniqueUsernames.push(u);
-    }
-
-    // Fetch each unique username once, with a 2-second stagger to smooth CPU load.
     for (let i = 0; i < uniqueUsernames.length; i++) {
-      if (i > 0) await new Promise(r => setTimeout(r, 2_000)); // stagger
-      const username = uniqueUsernames[i];
+      const u = uniqueUsernames[i];
       try {
-        // Use the earliest lastId across all rows for this username so we
-        // don't miss tweets for any guild that was added later.
-        const usernameRows = rows.filter(r => r.twitter_user === username);
-        const lastIds = usernameRows.map(r => r.last_tweet_id).filter(Boolean) as string[];
-        const earliestId = lastIds.length
-          ? lastIds.reduce((a, b) =>
-              isNumericId(a) && isNumericId(b)
-                ? (BigInt(a) < BigInt(b) ? a : b)
-                : a
-            )
-          : null;
-        const result = await fetchLatestTweets(username, earliestId);
-        console.log(`[TweetMonitor] @${username} ✓ via ${result.source} (${result.tweets.length} new tweet(s))`);
-        fetchCache.set(username, result);
+        fetchCache.set(u, await fetchLatestTweets(u, minSinceId.get(u) ?? null));
       } catch (err: any) {
-        fetchCache.set(username, err instanceof Error ? err : new Error(String(err)));
+        fetchCache.set(u, err instanceof Error ? err : new Error(String(err)));
+      }
+      if (i < uniqueUsernames.length - 1) {
+        await new Promise<void>(resolve => setTimeout(resolve, 2_000)); // 2 s stagger
       }
     }
 
-    // ── Deliver results to each guild/channel ─────────────────────────────────
+    // ── Phase 2: distribute cached results to every (guild, username) row ──────
     for (const row of rows) {
       try {
-        const cached = fetchCache.get(row.twitter_user);
-        let fetchedTweets: Tweet[] | null = null;
-        let fetchSource = "cache";
-
-        if (!cached || cached instanceof Error) {
-          const errMsg = cached instanceof Error ? cached.message : "unknown";
-          if (errMsg === "unreachable" || errMsg === "slow-retry") continue; // expected skip
-
-          // Real fetch error — update fail counts in DB and alert if needed
-          const newFailCount = (row.fail_count ?? 0) + 1;
-          const nowUnreachable = newFailCount >= DEAD_THRESHOLD;
-          console.error(`[TweetMonitor] @${row.twitter_user} poll failed (attempt ${newFailCount}): ${errMsg}`);
-          await pool.query(
-            `UPDATE tweet_monitors SET fail_count = $1, last_fail_at = NOW(), unreachable = $2
-             WHERE guild_id = $3 AND twitter_user = $4`,
-            [newFailCount, nowUnreachable, row.guild_id, row.twitter_user]
-          );
-          if (nowUnreachable) {
-            console.warn(`[TweetMonitor] @${row.twitter_user} marked unreachable after ${newFailCount} failures`);
-            const channel = (
-              client.channels.cache.get(row.channel_id) ??
-              await client.channels.fetch(row.channel_id).catch(() => null)
-            ) as TextChannel | null;
-            if (channel) {
-              await channel.send(
-                `⚠️ **Twitter/X Monitor**: Could not reach **@${row.twitter_user}** after ${newFailCount} attempts.\n` +
-                `This account may be **private**, **suspended**, or the RSS feed is permanently blocked.\n` +
-                `Use \`!removetwitter @${row.twitter_user}\` to stop monitoring it, or \`!twittercheck @${row.twitter_user}\` to retry manually.`
-              ).catch(() => {});
-            }
-          }
-          continue;
-        }
-
-        fetchedTweets = (cached as { tweets: Tweet[]; source: string }).tweets;
-        fetchSource   = (cached as { tweets: Tweet[]; source: string }).source;
-
-        // Success — reset fail count for this guild row if it had prior failures
-        if (row.fail_count > 0) {
-          await pool.query(
-            `UPDATE tweet_monitors SET fail_count = 0, last_fail_at = NULL, unreachable = FALSE
-             WHERE guild_id = $1 AND twitter_user = $2`,
-            [row.guild_id, row.twitter_user]
-          );
-        }
-
-        if (!fetchedTweets.length) continue;
-
-        // 48-hour age filter
-        const MAX_TWEET_AGE_MS = 48 * 60 * 60 * 1000;
-        const MAX_TWEETS_PER_POLL = 5;
-        const recentTweets = fetchedTweets.filter(t => {
-          if (!t.pubDate) return true;
-          return Date.now() - new Date(t.pubDate).getTime() < MAX_TWEET_AGE_MS;
-        });
-
-        if (recentTweets.length === 0 && fetchedTweets.length > 0) {
-          // All stale — advance lastId without posting
-          const newestStale = fetchedTweets.reduce((a, b) =>
-            isNumericId(a.id) && isNumericId(b.id) && BigInt(a.id) > BigInt(b.id) ? a : b
-          );
-          const savedId = isNumericId(newestStale.id) ? newestStale.id : row.last_tweet_id;
-          if (savedId && savedId !== row.last_tweet_id) {
-            await pool.query(
-              `UPDATE tweet_monitors SET last_tweet_id = $1 WHERE guild_id = $2 AND twitter_user = $3`,
-              [savedId, row.guild_id, row.twitter_user]
-            );
-          }
-          continue;
-        }
-
-        // Filter to only tweets newer than THIS guild's lastId
-        const rowLastId = row.last_tweet_id;
-        const newForThisGuild = rowLastId
-          ? recentTweets.filter(t =>
-              isNumericId(t.id) && isNumericId(rowLastId)
-                ? BigInt(t.id) > BigInt(rowLastId)
-                : t.id !== rowLastId
-            ).slice(0, MAX_TWEETS_PER_POLL)
-          : [recentTweets[0]].filter(Boolean); // first run: seed without posting old tweets
-
-        if (!newForThisGuild.length) continue;
-
-        const channel = client.channels.cache.get(row.channel_id) as TextChannel | undefined;
-        if (!channel) continue;
-
-        for (const tweet of newForThisGuild) {
-          try {
-            await channel.send({
-              embeds: [buildTweetEmbed(tweet, row.twitter_user)],
-              components: [buildTweetButton(tweet.url)],
-            });
-          } catch { /* channel deleted or no perms */ }
-        }
-
-        const latestSentId = newForThisGuild[newForThisGuild.length - 1].id;
-        const savedId = isNumericId(latestSentId) ? latestSentId : rowLastId;
-        if (savedId && savedId !== rowLastId) {
+        const result = await pollAccount(
+          client,
+          row.guild_id,
+          row.channel_id,
+          row.twitter_user,
+          row.last_tweet_id,
+          row.fail_count ?? 0,
+          row.last_fail_at,
+          row.unreachable ?? false,
+          fetchCache.get(row.twitter_user), // undefined for unreachable/slow-retry rows
+        );
+        if (result.newId && result.newId !== row.last_tweet_id) {
           await pool.query(
             `UPDATE tweet_monitors SET last_tweet_id = $1 WHERE guild_id = $2 AND twitter_user = $3`,
-            [savedId, row.guild_id, row.twitter_user]
+            [result.newId, row.guild_id, row.twitter_user],
           );
         }
       } catch (rowErr) {
-        console.error(`[TweetMonitor] Error delivering @${row.twitter_user} to guild ${row.guild_id}:`, rowErr);
+        console.error(`[TweetMonitor] Error polling @${row.twitter_user}:`, rowErr);
       }
     }
   } finally {
@@ -848,9 +1096,9 @@ export async function removeTwitterAccount(guildId: string, username: string): P
 
 export async function listTwitterAccounts(
   guildId: string,
-): Promise<Array<{ username: string; channelId: string; unreachable: boolean; failCount: number }>> {
+): Promise<Array<{ username: string; channelId: string; unreachable: boolean; failCount: number; lastTweetId: string | null; lastError: string | null }>> {
   const { rows } = await pool.query(
-    `SELECT twitter_user, channel_id, unreachable, fail_count FROM tweet_monitors WHERE guild_id = $1 ORDER BY twitter_user`,
+    `SELECT twitter_user, channel_id, unreachable, fail_count, last_tweet_id, last_error FROM tweet_monitors WHERE guild_id = $1 ORDER BY twitter_user`,
     [guildId],
   );
   return rows.map(r => ({
@@ -858,7 +1106,19 @@ export async function listTwitterAccounts(
     channelId:   r.channel_id,
     unreachable: r.unreachable,
     failCount:   r.fail_count ?? 0,
+    lastTweetId: r.last_tweet_id ?? null,
+    lastError:   r.last_error ?? null,
   }));
+}
+
+export async function resetAllTwitterAccounts(guildId: string): Promise<number> {
+  const res = await pool.query(
+    `UPDATE tweet_monitors
+     SET fail_count = 0, last_fail_at = NULL, unreachable = FALSE, last_error = NULL
+     WHERE guild_id = $1 AND fail_count > 0`,
+    [guildId],
+  );
+  return res.rowCount ?? 0;
 }
 
 export { FAILURE_THRESHOLD };
@@ -960,16 +1220,22 @@ async function handleTwitterList(message: Message): Promise<void> {
 
   const lines = res.rows.map((r: any) => {
     let status = "✅";
-    if (r.unreachable) status = "🔴 unreachable";
-    else if (r.fail_count >= FAILURE_THRESHOLD) status = `⚠️ failing (${r.fail_count} errors, hourly retry)`;
-    return `${status} **@${r.twitter_user}** → <#${r.channel_id}>`;
+    let errNote = "";
+    if (r.unreachable) {
+      status = "🔴";
+      if (r.last_error) errNote = `\n  └ \`${String(r.last_error).slice(0, 120)}\``;
+    } else if (r.fail_count >= FAILURE_THRESHOLD) {
+      status = "⚠️";
+      if (r.last_error) errNote = `\n  └ \`${String(r.last_error).slice(0, 120)}\``;
+    }
+    return `${status} **@${r.twitter_user}** → <#${r.channel_id}>${errNote}`;
   });
 
   const embed = new EmbedBuilder()
     .setColor(Colors.Blue)
     .setTitle("🐦 Monitored X / Twitter Accounts")
     .setDescription(lines.join("\n"))
-    .setFooter({ text: "✅ active • ⚠️ failing (hourly retry) • 🔴 unreachable (use !removetwitter)" });
+    .setFooter({ text: "✅ active • ⚠️ failing → use /twitterreset to retry now • 🔴 unreachable" });
 
   await message.reply({ embeds: [embed] });
 }
@@ -1064,13 +1330,44 @@ async function handleTwitterStatus(message: Message, args: string[]): Promise<vo
   await msg.edit({ content: "", embeds: [embed] });
 }
 
+async function handleTwitterReset(message: Message): Promise<void> {
+  if (!isAdmin(message)) {
+    await message.reply("❌ Only admins can use this command.");
+    return;
+  }
+  const count = await resetAllTwitterAccounts(message.guild!.id);
+  if (count === 0) {
+    await message.reply("✅ All accounts are already healthy — no reset needed.");
+  } else {
+    await message.reply(`♻️ Reset **${count}** account(s) — they will retry on the next poll cycle (within 5 minutes).`);
+  }
+}
+
 // ─── Register ────────────────────────────────────────────────────────────────
+// Stored ref so we can clear the old interval on reconnect — prevents N intervals
+// each holding a stale client reference after repeated reconnects.
+let _tweetPollIntervalRef: ReturnType<typeof setInterval> | null = null;
+
 export function registerTweetMonitor(client: Client): void {
-  setInterval(() => runPollCycle(client), POLL_INTERVAL_MS);
-  setTimeout(() => runPollCycle(client), 30_000);
+  // Clear interval from previous connect() call (interval leak fix)
+  if (_tweetPollIntervalRef) {
+    clearInterval(_tweetPollIntervalRef);
+    _tweetPollIntervalRef = null;
+  }
+
+  _tweetPollIntervalRef = setInterval(
+    () => runPollCycle(client).catch(e => console.error("[TweetMonitor] Poll cycle crashed:", e)),
+    POLL_INTERVAL_MS,
+  );
+  // First poll 30 s after startup (gives Discord connection time to stabilise)
+  setTimeout(
+    () => runPollCycle(client).catch(e => console.error("[TweetMonitor] Initial poll crashed:", e)),
+    30_000,
+  );
 
   client.on(Events.MessageCreate, async (message: Message) => {
     if (message.author.bot || !message.guild) return;
+    try {
     if (!(await isClaimed(message.id))) return;
     if (!message.content.startsWith(PREFIX)) return;
 
@@ -1082,5 +1379,10 @@ export function registerTweetMonitor(client: Client): void {
     if (cmd === "twitterlist")    await handleTwitterList(message);
     if (cmd === "twittercheck")   await handleTwitterCheck(message, args);
     if (cmd === "twitterstatus")  await handleTwitterStatus(message, args);
+    if (cmd === "twitterreset")   await handleTwitterReset(message);
+    } catch (err) {
+      console.error("[Tweet-Monitor] Command handler error:", err);
+      await message.reply("❌ Something went wrong. Please try again.").catch(() => {});
+    }
   });
 }
