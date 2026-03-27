@@ -585,131 +585,6 @@ export function buildTweetButton(tweetUrl: string): ActionRowBuilder<ButtonBuild
   );
 }
 
-// ─── Poll one username for one guild ─────────────────────────────────────────
-async function pollAccount(
-  client: Client,
-  guildId: string,
-  channelId: string,
-  username: string,
-  lastId: string | null,
-  failCount: number,
-  lastFailAt: Date | null,
-  unreachable: boolean
-): Promise<{ newId: string | null; failCount: number; unreachable: boolean }> {
-
-  // Skip unreachable accounts entirely
-  if (unreachable) return { newId: lastId, failCount, unreachable: true };
-
-  // Slow-retry: if failing consistently, check only once every SLOW_RETRY_INTERVAL_MS (6 h)
-  if (failCount >= FAILURE_THRESHOLD && lastFailAt) {
-    const msSinceFail = Date.now() - lastFailAt.getTime();
-    if (msSinceFail < SLOW_RETRY_INTERVAL_MS) {
-      return { newId: lastId, failCount, unreachable: false }; // skip this cycle
-    }
-  }
-
-  let tweets: Tweet[];
-  let source = "unknown";
-  try {
-    const result = await fetchLatestTweets(username, lastId);
-    tweets = result.tweets;
-    source = result.source;
-    console.log(`[TweetMonitor] @${username} ✓ via ${source} (${tweets.length} new tweet(s))`);
-  } catch (err: any) {
-    const errMsg = String(err?.message ?? err).slice(0, 300);
-    const newFailCount = failCount + 1;
-    const nowUnreachable = newFailCount >= DEAD_THRESHOLD;
-
-    // Always log the actual error so it's visible in logs
-    console.error(`[TweetMonitor] @${username} poll failed (attempt ${newFailCount}): ${errMsg}`);
-
-    await pool.query(
-      `UPDATE tweet_monitors SET fail_count = $1, last_fail_at = NOW(), unreachable = $2
-       WHERE guild_id = $3 AND twitter_user = $4`,
-      [newFailCount, nowUnreachable, guildId, username]
-    );
-
-    if (newFailCount === FAILURE_THRESHOLD) {
-      console.warn(`[TweetMonitor] @${username} — switching to hourly retry after ${newFailCount} failures`);
-    }
-
-    if (nowUnreachable) {
-      console.warn(`[TweetMonitor] @${username} marked unreachable after ${newFailCount} failures`);
-      // Notify the monitor channel — fetch from API if not in cache (post-restart safe)
-      const channel = (
-        client.channels.cache.get(channelId) ??
-        await client.channels.fetch(channelId).catch(() => null)
-      ) as TextChannel | null;
-      if (channel) {
-        await channel.send(
-          `⚠️ **Twitter/X Monitor**: Could not reach **@${username}** after ${newFailCount} attempts.\n` +
-          `This account may be **private**, **suspended**, or the RSS feed is permanently blocked.\n` +
-          `Use \`!removetwitter @${username}\` to stop monitoring it, or \`!twittercheck @${username}\` to retry manually.`
-        ).catch(() => {});
-      }
-    }
-
-    return { newId: lastId, failCount: newFailCount, unreachable: nowUnreachable };
-  }
-
-  // Success — reset fail count
-  if (failCount > 0) {
-    await pool.query(
-      `UPDATE tweet_monitors SET fail_count = 0, last_fail_at = NULL, unreachable = FALSE
-       WHERE guild_id = $1 AND twitter_user = $2`,
-      [guildId, username]
-    );
-  }
-
-  if (!tweets.length) return { newId: lastId, failCount: 0, unreachable: false };
-
-  // Safety cap: never post tweets older than 48 hours (prevents RSS flood of old posts)
-  const MAX_TWEET_AGE_MS = 48 * 60 * 60 * 1000;
-  const MAX_TWEETS_PER_POLL = 5; // safety cap — never spam more than 5 per cycle
-
-  const recentTweets = tweets.filter(t => {
-    if (!t.pubDate) return true; // no date info → include (let it through)
-    const age = Date.now() - new Date(t.pubDate).getTime();
-    return age < MAX_TWEET_AGE_MS;
-  });
-
-  // If all fetched tweets are older than 48h, it means the saved lastId is stale.
-  // Update lastId to the newest tweet we saw (to skip the backlog) but post nothing.
-  if (recentTweets.length === 0 && tweets.length > 0) {
-    const newestStale = tweets.reduce((a, b) =>
-      isNumericId(a.id) && isNumericId(b.id) && BigInt(a.id) > BigInt(b.id) ? a : b
-    );
-    const savedId = isNumericId(newestStale.id) ? newestStale.id : lastId;
-    console.log(`[TweetMonitor] @${username} — all ${tweets.length} fetched tweets are >48h old, skipping backlog, advancing lastId`);
-    return { newId: savedId, failCount: 0, unreachable: false };
-  }
-
-  // Twitter API v2 with since_id already returns only new tweets.
-  // Reverse so oldest posts first (API returns newest first), then cap.
-  const newTweets = lastId
-    ? [...recentTweets].reverse().slice(0, MAX_TWEETS_PER_POLL)
-    : [recentTweets[0]].filter(Boolean); // first run: seed lastId without posting old tweets
-
-  if (!newTweets.length) return { newId: lastId, failCount: 0, unreachable: false };
-
-  const channel = client.channels.cache.get(channelId) as TextChannel | undefined;
-  if (!channel) return { newId: lastId, failCount: 0, unreachable: false };
-
-  for (const tweet of newTweets) {
-    try {
-      await channel.send({
-        embeds: [buildTweetEmbed(tweet, username)],
-        components: [buildTweetButton(tweet.url)],
-      });
-    } catch { /* channel deleted or no perms */ }
-  }
-
-  const latestSentId = newTweets[newTweets.length - 1].id;
-  // Only persist numeric IDs — non-numeric IDs (malformed URLs) would break future BigInt comparisons
-  const savedId = isNumericId(latestSentId) ? latestSentId : lastId;
-  return { newId: savedId, failCount: 0, unreachable: false };
-}
-
 // ─── Polling loop ─────────────────────────────────────────────────────────────
 let pollRunning = false; // prevent concurrent poll cycles within the same process
 
@@ -764,26 +639,166 @@ async function runPollCycle(client: Client): Promise<void> {
       return;
     }
 
+    // ── Deduplicate by username ───────────────────────────────────────────────
+    // If the same Twitter account is monitored in multiple guilds/channels, we
+    // only call the GraphQL / RSS API ONCE per username per cycle.  Results are
+    // shared across all rows that match the username, drastically cutting HTTP
+    // requests and CPU pressure (which was causing false-positive watchdog
+    // reconnects and "The application did not respond" errors).
+    const fetchCache = new Map<string, { tweets: Tweet[]; source: string } | Error>();
+
+    // Collect unique usernames in the order they appear (skip unreachable / slow-retry).
+    const uniqueUsernames: string[] = [];
+    for (const row of rows) {
+      const u = row.twitter_user;
+      if (fetchCache.has(u)) continue;              // already queued
+      if (row.unreachable) {
+        fetchCache.set(u, new Error("unreachable")); // sentinel — skip silently
+        continue;
+      }
+      if (row.fail_count >= FAILURE_THRESHOLD && row.last_fail_at) {
+        const msSinceFail = Date.now() - new Date(row.last_fail_at).getTime();
+        if (msSinceFail < SLOW_RETRY_INTERVAL_MS) {
+          fetchCache.set(u, new Error("slow-retry"));
+          continue;
+        }
+      }
+      fetchCache.set(u, new Error("pending")); // placeholder so it's not re-queued
+      uniqueUsernames.push(u);
+    }
+
+    // Fetch each unique username once, with a 2-second stagger to smooth CPU load.
+    for (let i = 0; i < uniqueUsernames.length; i++) {
+      if (i > 0) await new Promise(r => setTimeout(r, 2_000)); // stagger
+      const username = uniqueUsernames[i];
+      try {
+        // Use the earliest lastId across all rows for this username so we
+        // don't miss tweets for any guild that was added later.
+        const usernameRows = rows.filter(r => r.twitter_user === username);
+        const lastIds = usernameRows.map(r => r.last_tweet_id).filter(Boolean) as string[];
+        const earliestId = lastIds.length
+          ? lastIds.reduce((a, b) =>
+              isNumericId(a) && isNumericId(b)
+                ? (BigInt(a) < BigInt(b) ? a : b)
+                : a
+            )
+          : null;
+        const result = await fetchLatestTweets(username, earliestId);
+        console.log(`[TweetMonitor] @${username} ✓ via ${result.source} (${result.tweets.length} new tweet(s))`);
+        fetchCache.set(username, result);
+      } catch (err: any) {
+        fetchCache.set(username, err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    // ── Deliver results to each guild/channel ─────────────────────────────────
     for (const row of rows) {
       try {
-        const result = await pollAccount(
-          client,
-          row.guild_id,
-          row.channel_id,
-          row.twitter_user,
-          row.last_tweet_id,
-          row.fail_count ?? 0,
-          row.last_fail_at,
-          row.unreachable ?? false,
-        );
-        if (result.newId && result.newId !== row.last_tweet_id) {
+        const cached = fetchCache.get(row.twitter_user);
+        let fetchedTweets: Tweet[] | null = null;
+        let fetchSource = "cache";
+
+        if (!cached || cached instanceof Error) {
+          const errMsg = cached instanceof Error ? cached.message : "unknown";
+          if (errMsg === "unreachable" || errMsg === "slow-retry") continue; // expected skip
+
+          // Real fetch error — update fail counts in DB and alert if needed
+          const newFailCount = (row.fail_count ?? 0) + 1;
+          const nowUnreachable = newFailCount >= DEAD_THRESHOLD;
+          console.error(`[TweetMonitor] @${row.twitter_user} poll failed (attempt ${newFailCount}): ${errMsg}`);
+          await pool.query(
+            `UPDATE tweet_monitors SET fail_count = $1, last_fail_at = NOW(), unreachable = $2
+             WHERE guild_id = $3 AND twitter_user = $4`,
+            [newFailCount, nowUnreachable, row.guild_id, row.twitter_user]
+          );
+          if (nowUnreachable) {
+            console.warn(`[TweetMonitor] @${row.twitter_user} marked unreachable after ${newFailCount} failures`);
+            const channel = (
+              client.channels.cache.get(row.channel_id) ??
+              await client.channels.fetch(row.channel_id).catch(() => null)
+            ) as TextChannel | null;
+            if (channel) {
+              await channel.send(
+                `⚠️ **Twitter/X Monitor**: Could not reach **@${row.twitter_user}** after ${newFailCount} attempts.\n` +
+                `This account may be **private**, **suspended**, or the RSS feed is permanently blocked.\n` +
+                `Use \`!removetwitter @${row.twitter_user}\` to stop monitoring it, or \`!twittercheck @${row.twitter_user}\` to retry manually.`
+              ).catch(() => {});
+            }
+          }
+          continue;
+        }
+
+        fetchedTweets = (cached as { tweets: Tweet[]; source: string }).tweets;
+        fetchSource   = (cached as { tweets: Tweet[]; source: string }).source;
+
+        // Success — reset fail count for this guild row if it had prior failures
+        if (row.fail_count > 0) {
+          await pool.query(
+            `UPDATE tweet_monitors SET fail_count = 0, last_fail_at = NULL, unreachable = FALSE
+             WHERE guild_id = $1 AND twitter_user = $2`,
+            [row.guild_id, row.twitter_user]
+          );
+        }
+
+        if (!fetchedTweets.length) continue;
+
+        // 48-hour age filter
+        const MAX_TWEET_AGE_MS = 48 * 60 * 60 * 1000;
+        const MAX_TWEETS_PER_POLL = 5;
+        const recentTweets = fetchedTweets.filter(t => {
+          if (!t.pubDate) return true;
+          return Date.now() - new Date(t.pubDate).getTime() < MAX_TWEET_AGE_MS;
+        });
+
+        if (recentTweets.length === 0 && fetchedTweets.length > 0) {
+          // All stale — advance lastId without posting
+          const newestStale = fetchedTweets.reduce((a, b) =>
+            isNumericId(a.id) && isNumericId(b.id) && BigInt(a.id) > BigInt(b.id) ? a : b
+          );
+          const savedId = isNumericId(newestStale.id) ? newestStale.id : row.last_tweet_id;
+          if (savedId && savedId !== row.last_tweet_id) {
+            await pool.query(
+              `UPDATE tweet_monitors SET last_tweet_id = $1 WHERE guild_id = $2 AND twitter_user = $3`,
+              [savedId, row.guild_id, row.twitter_user]
+            );
+          }
+          continue;
+        }
+
+        // Filter to only tweets newer than THIS guild's lastId
+        const rowLastId = row.last_tweet_id;
+        const newForThisGuild = rowLastId
+          ? recentTweets.filter(t =>
+              isNumericId(t.id) && isNumericId(rowLastId)
+                ? BigInt(t.id) > BigInt(rowLastId)
+                : t.id !== rowLastId
+            ).slice(0, MAX_TWEETS_PER_POLL)
+          : [recentTweets[0]].filter(Boolean); // first run: seed without posting old tweets
+
+        if (!newForThisGuild.length) continue;
+
+        const channel = client.channels.cache.get(row.channel_id) as TextChannel | undefined;
+        if (!channel) continue;
+
+        for (const tweet of newForThisGuild) {
+          try {
+            await channel.send({
+              embeds: [buildTweetEmbed(tweet, row.twitter_user)],
+              components: [buildTweetButton(tweet.url)],
+            });
+          } catch { /* channel deleted or no perms */ }
+        }
+
+        const latestSentId = newForThisGuild[newForThisGuild.length - 1].id;
+        const savedId = isNumericId(latestSentId) ? latestSentId : rowLastId;
+        if (savedId && savedId !== rowLastId) {
           await pool.query(
             `UPDATE tweet_monitors SET last_tweet_id = $1 WHERE guild_id = $2 AND twitter_user = $3`,
-            [result.newId, row.guild_id, row.twitter_user],
+            [savedId, row.guild_id, row.twitter_user]
           );
         }
       } catch (rowErr) {
-        console.error(`[TweetMonitor] Error polling @${row.twitter_user}:`, rowErr);
+        console.error(`[TweetMonitor] Error delivering @${row.twitter_user} to guild ${row.guild_id}:`, rowErr);
       }
     }
   } finally {

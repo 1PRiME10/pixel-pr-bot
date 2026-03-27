@@ -732,11 +732,15 @@ async function connect(token: string): Promise<void> {
       return;
     }
 
-    // Ping spike: >600ms twice in a row (~40s total) → proactive reconnect
-    if (wsPing > 600) {
+    // Ping spike: >2000ms three times in a row (~45s total) → proactive reconnect.
+    // Threshold raised from 600ms to 2000ms because Render free-tier CPU throttling and
+    // concurrent TweetMonitor HTTP requests can temporarily spike WS ping to 600-1500ms
+    // without the connection being actually dead. Firing too early causes a disconnect
+    // loop that makes slash commands show "The application did not respond".
+    if (wsPing > 2000) {
       highPingStrikes++;
-      console.warn(`[Watchdog] High ping: ${wsPing}ms (strike ${highPingStrikes}/2)`);
-      if (highPingStrikes >= 2) {
+      console.warn(`[Watchdog] High ping: ${wsPing}ms (strike ${highPingStrikes}/3)`);
+      if (highPingStrikes >= 3) {
         highPingStrikes = 0;
         console.warn("[Watchdog] Sustained high ping — proactive reconnect...");
         scheduleReconnect(token);
@@ -747,14 +751,14 @@ async function connect(token: string): Promise<void> {
     }
 
     // Heartbeat staleness: Discord heartbeats every ~41s.
-    // If last ping timestamp is older than 2.5× the interval → connection frozen.
-    // Detects dead connections BEFORE ping shows -1.
+    // If last ping timestamp is older than 3× the interval → connection frozen.
+    // (Raised from 2.5× to 3× to give more headroom during heavy TweetMonitor cycles.)
     const shard = client.ws.shards.first();
     if (shard) {
       const hbInterval = (shard as any).heartbeatInterval ?? 45_000;
       const lastPing   = (shard as any).lastPingTimestamp ?? 0;
       const staleMs    = Date.now() - lastPing;
-      if (lastPing > 0 && staleMs > hbInterval * 2.5) {
+      if (lastPing > 0 && staleMs > hbInterval * 3) {
         console.warn(`[Watchdog] Heartbeat stale ${Math.round(staleMs / 1000)}s — reconnecting`);
         scheduleReconnect(token);
       }
