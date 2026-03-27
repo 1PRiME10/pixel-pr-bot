@@ -43,7 +43,7 @@ import {
 import { clearMemory } from "./memory.js";
 import { getWarnings, addWarningAndCheck, clearWarnings } from "./moderation.js";
 import { pickEmoji, parseEmotion, getExpressionImagePath } from "./ai-hoshino-emojis.js";
-import { addTwitterAccount, removeTwitterAccount, listTwitterAccounts, cleanUsername, FAILURE_THRESHOLD } from "./tweet-monitor.js";
+import { addTwitterAccount, removeTwitterAccount, listTwitterAccounts, resetAllTwitterAccounts, cleanUsername, FAILURE_THRESHOLD } from "./tweet-monitor.js";
 import {
   addYouTubeChannel, removeYouTubeChannel, listYouTubeChannels,
   resolveYTChannelId, findYTChannelByName, fetchLatestVideos as fetchYTVideos,
@@ -89,6 +89,12 @@ import {
   runSecurityScan, hardenSecurity, getSecurityStatus,
 } from "./security-hardening.js";
 import { initRegistrar } from "../plugin-registrar.js";
+import {
+  activateVoiceAI, deactivateVoiceAI, voiceAIStates,
+  setVoiceAIChannel, removeVoiceAIChannel, getVoiceAIChannel,
+} from "./voice-ai.js";
+import { fetchLatestTweets, buildTweetEmbed, buildTweetButton, cleanUsername, cacheTwitterUserId } from "./tweet-monitor.js";
+import { setJokeChannel, removeJokeChannel, getJokeScheduleChannel, generateAndSendJoke } from "./joke-scheduler.js";
 
 const REP_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
@@ -713,6 +719,75 @@ const commands = [
     .setName("plugins")
     .setDescription("Show all AI-built commands in this server — status, description, and test buttons (admin only)")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  // ── Twitter manual poll (Admin only) ──────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName("twitterpoll")
+    .setDescription("Manually check a monitored Twitter/X account right now and show debug info (Admin only)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o =>
+      o.setName("username")
+       .setDescription("Twitter username (without @)")
+       .setRequired(true)),
+
+  // ── Twitter reset all failures (Admin only) ────────────────────────────────
+  new SlashCommandBuilder()
+    .setName("twitterreset")
+    .setDescription("Reset all failing Twitter/X accounts and force them to retry immediately (Admin only)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  // ── Joke auto-scheduler (Admin only) ──────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName("jokeschedule")
+    .setDescription("Auto-post 5 anime jokes per day to a channel (Admin only)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(s =>
+      s.setName("set")
+       .setDescription("Set the channel for daily auto-jokes")
+       .addChannelOption(o =>
+         o.setName("channel")
+          .setDescription("The text channel to post jokes in")
+          .setRequired(true)))
+    .addSubcommand(s =>
+      s.setName("off")
+       .setDescription("Stop auto-posting jokes"))
+    .addSubcommand(s =>
+      s.setName("status")
+       .setDescription("Check which channel jokes are being posted to")),
+
+  // ── Voice AI text-channel config (Admin only) ─────────────────────────────
+  new SlashCommandBuilder()
+    .setName("setvoicechannel")
+    .setDescription("Set the text channel where Voice AI transcripts and replies are posted (Admin only)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(s =>
+      s.setName("set")
+       .setDescription("Set the text channel for Voice AI")
+       .addChannelOption(o =>
+         o.setName("channel")
+          .setDescription("The text channel to receive voice transcripts & AI replies")
+          .setRequired(true)))
+    .addSubcommand(s =>
+      s.setName("clear")
+       .setDescription("Remove the saved channel (Voice AI will use whichever channel /voicechat on is run in)"))
+    .addSubcommand(s =>
+      s.setName("status")
+       .setDescription("Show the currently configured Voice AI text channel")),
+
+  // ── Voice AI (Admin only) ─────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName("voicechat")
+    .setDescription("Voice AI — PIXEL listens in voice and responds aloud (Admin only)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(s =>
+      s.setName("on")
+       .setDescription("Join your current voice channel and start listening"))
+    .addSubcommand(s =>
+      s.setName("off")
+       .setDescription("Stop listening and leave the voice channel"))
+    .addSubcommand(s =>
+      s.setName("status")
+       .setDescription("Check if Voice AI is currently active")),
 
 ].map(c => c.toJSON());
 
@@ -1875,6 +1950,264 @@ function handleInteractions(client: Client): void {
         return;
       }
 
+      // ── /voicechat ─────────────────────────────────────────────────────────
+      if (commandName === "voicechat") {
+        const sub  = interaction.options.getSubcommand();
+        const gid  = interaction.guildId!;
+        const guild = interaction.guild!;
+
+        if (sub === "on") {
+          const member = interaction.member as GuildMember | null;
+          const vcId   = member?.voice.channelId ?? null;
+          if (!vcId) {
+            await interaction.reply({ content: "❌ You need to be in a **voice channel** first, then run `/voicechat on`.", flags: MessageFlags.Ephemeral });
+            return;
+          }
+          const vc = guild.channels.cache.get(vcId);
+          if (!vc) {
+            await interaction.reply({ content: "❌ Could not find your voice channel.", flags: MessageFlags.Ephemeral });
+            return;
+          }
+          // Use the saved text channel if configured, otherwise fall back to the current channel
+          const savedChId  = await getVoiceAIChannel(gid);
+          const textChId   = savedChId ?? interaction.channelId;
+          activateVoiceAI(client, guild, vcId, textChId);
+          const savedNote = savedChId
+            ? `\nTranscripts → <#${savedChId}> *(set via \`/setvoicechannel\`)*`
+            : `\nTranscripts → <#${interaction.channelId}> *(this channel — use \`/setvoicechannel set\` to change)*`;
+          await interaction.reply({
+            content:
+              `✅ **Voice AI ON** in **${vc.name}** 🎤\n` +
+              `Speak — I'll transcribe and reply${savedNote}\n` +
+              `Radio keeps playing while I listen.\n` +
+              `Use \`/voicechat off\` to stop.`,
+          });
+          return;
+        }
+
+        if (sub === "off") {
+          const wasActive = deactivateVoiceAI(gid);
+          if (!wasActive) {
+            await interaction.reply({ content: "❌ Voice AI is not active.", flags: MessageFlags.Ephemeral });
+          } else {
+            await interaction.reply({ content: "⏹️ **Voice AI OFF**." });
+          }
+          return;
+        }
+
+        if (sub === "status") {
+          const state = voiceAIStates.get(gid);
+          if (!state?.enabled) {
+            await interaction.reply({ content: "Voice AI is **off**. Join a voice channel and use `/voicechat on` to activate.", flags: MessageFlags.Ephemeral });
+          } else {
+            await interaction.reply({
+              content:
+                `🎤 Voice AI is **ON**\n` +
+                `Voice channel: <#${state.voiceChannelId}>\n` +
+                `Text channel: <#${state.textChannelId}>\n` +
+                `Use \`/voicechat off\` to stop.`,
+              flags: MessageFlags.Ephemeral,
+            });
+          }
+          return;
+        }
+      }
+
+      // ── /setvoicechannel ───────────────────────────────────────────────────
+      if (commandName === "setvoicechannel") {
+        const sub = interaction.options.getSubcommand();
+        const gid = interaction.guildId!;
+
+        if (sub === "set") {
+          const ch = interaction.options.getChannel("channel", true) as TextChannel;
+          await setVoiceAIChannel(gid, ch.id);
+          await interaction.reply({
+            content:
+              `✅ **Voice AI text channel set** → <#${ch.id}>\n` +
+              `All transcripts and AI replies will now go there.\n` +
+              `Use \`/voicechat on\` in any channel — output will always land in <#${ch.id}>.\n` +
+              `Use \`/setvoicechannel clear\` to remove this setting.`,
+          });
+          return;
+        }
+
+        if (sub === "clear") {
+          const removed = await removeVoiceAIChannel(gid);
+          await interaction.reply({
+            content: removed
+              ? "🗑️ **Voice AI channel cleared** — transcripts will now go to whichever channel `/voicechat on` is run in."
+              : "❌ No Voice AI channel was saved.",
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        if (sub === "status") {
+          const chId = await getVoiceAIChannel(gid);
+          const activeState = voiceAIStates.get(gid);
+          if (!chId) {
+            await interaction.reply({
+              content:
+                "No saved Voice AI channel. Transcripts go to whichever channel `/voicechat on` is used in.\n" +
+                "Use `/setvoicechannel set #channel` to pin it.",
+              flags: MessageFlags.Ephemeral,
+            });
+          } else {
+            await interaction.reply({
+              content:
+                `🎙️ **Voice AI text channel:** <#${chId}>\n` +
+                (activeState?.enabled
+                  ? `🟢 Voice AI is **active** in <#${activeState.voiceChannelId}>`
+                  : "⚫ Voice AI is currently **off** (`/voicechat on` to start)"),
+              flags: MessageFlags.Ephemeral,
+            });
+          }
+          return;
+        }
+      }
+
+      // ── /twitterpoll ───────────────────────────────────────────────────────
+      if (commandName === "twitterpoll") {
+        const username = cleanUsername(interaction.options.getString("username", true));
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const proxyUrl    = process.env.TWITTER_PROXY_URL;
+        const proxySecret = process.env.TWITTER_PROXY_SECRET;
+
+        // ── Step 1: Try fetchLatestTweets (real path, no extra Worker call) ──
+        let fetchResult: { tweets: any[]; source: string } | null = null;
+        let fetchErr = "";
+        try {
+          fetchResult = await fetchLatestTweets(username);
+        } catch (err: any) {
+          fetchErr = String(err?.message ?? err);
+        }
+
+        // ── Step 2: On success → show result immediately ──
+        if (fetchResult) {
+          const { tweets, source } = fetchResult;
+          if (!tweets.length) {
+            await interaction.editReply(
+              `✅ **@${username}** — fetched via \`${source}\`\n` +
+              `📭 No new tweets found (account may have no recent tweets, or all are already seen).`,
+            );
+            return;
+          }
+          const latest = tweets[0];
+          await interaction.editReply(
+            `✅ **@${username}** — fetched via \`${source}\`\n` +
+            `📨 **${tweets.length}** tweet(s) found. Latest:\n> ${latest?.text.slice(0, 200)}\n` +
+            `🔗 ${latest?.url}`,
+          );
+          const textCh = interaction.channel as TextChannel | null;
+          if (textCh) {
+            for (const t of tweets.slice(0, 3)) {
+              await textCh.send({
+                embeds: [buildTweetEmbed(t, username)],
+                components: [buildTweetButton(t.url)],
+              }).catch(() => {});
+            }
+          }
+          return;
+        }
+
+        // ── Step 3: Fetch failed — run proxy test for diagnostics ──
+        let proxyTest = "⏭️ skipped (TWITTER_PROXY_URL not set)";
+        if (proxyUrl && proxySecret) {
+          try {
+            const testUrl = new URL(proxyUrl);
+            testUrl.searchParams.set("username", username);
+            const r = await fetch(testUrl.toString(), {
+              headers: { Authorization: `Bearer ${proxySecret}` },
+              signal: AbortSignal.timeout(15_000),
+            });
+            const body = await r.text();
+            proxyTest = `HTTP ${r.status} → \`${body.slice(0, 150)}\``;
+            // Cache the userId returned by the Worker so the next real poll can skip UserByScreenName
+            try {
+              const parsed = JSON.parse(body) as { userId?: string };
+              if (parsed.userId) await cacheTwitterUserId(username, parsed.userId);
+            } catch { /* ignore parse errors */ }
+          } catch (e: any) {
+            proxyTest = `❌ ${e.message}`;
+          }
+        }
+
+        await interaction.editReply(
+          `🔧 **Proxy URL:** ${proxyUrl ? `\`${proxyUrl.slice(0, 55)}\`` : "❌ NOT SET"}\n` +
+          `🔑 **Secret:** ${proxySecret ? "✅ set" : "❌ NOT SET"}\n` +
+          `📡 **Proxy test:** ${proxyTest}\n` +
+          `❌ **@${username}** — fetch failed\n` +
+          `\`\`\`${fetchErr.slice(0, 500)}\`\`\``,
+        );
+        return;
+      }
+
+      // ── /twitterreset ──────────────────────────────────────────────────────
+      if (commandName === "twitterreset") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const gid = interaction.guildId!;
+        const count = await resetAllTwitterAccounts(gid);
+        if (count === 0) {
+          await interaction.editReply("✅ All accounts are already healthy — no reset needed.");
+        } else {
+          await interaction.editReply(
+            `♻️ Reset **${count}** failing account(s) — they will retry on the next poll cycle (within 5 minutes).\n` +
+            `Use \`/twitterlist\` to check their status after the next poll.`,
+          );
+        }
+        return;
+      }
+
+      // ── /jokeschedule ──────────────────────────────────────────────────────
+      if (commandName === "jokeschedule") {
+        const sub = interaction.options.getSubcommand();
+        const gid = interaction.guildId!;
+
+        if (sub === "set") {
+          const ch = interaction.options.getChannel("channel", true) as TextChannel;
+          await setJokeChannel(gid, ch.id);
+          await interaction.reply({
+            content:
+              `✅ **Joke Scheduler ON** → <#${ch.id}>\n` +
+              `PIXEL will auto-post 5 anime jokes per day at: 00:00, 05:00, 10:00, 15:00, 20:00 UTC.\n` +
+              `Use \`/jokeschedule off\` to stop.`,
+          });
+          return;
+        }
+
+        if (sub === "off") {
+          const removed = await removeJokeChannel(gid);
+          await interaction.reply({
+            content: removed
+              ? "⏹️ **Joke Scheduler OFF** — no more daily jokes."
+              : "❌ Joke Scheduler was not active.",
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        if (sub === "status") {
+          const chId = await getJokeScheduleChannel(gid);
+          if (!chId) {
+            await interaction.reply({ content: "Joke Scheduler is **off**. Use `/jokeschedule set #channel` to activate.", flags: MessageFlags.Ephemeral });
+          } else {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const textCh = (
+              client.channels.cache.get(chId) ??
+              await client.channels.fetch(chId).catch(() => null)
+            ) as TextChannel | null;
+            await interaction.editReply(
+              `😄 Joke Scheduler is **ON**\n` +
+              `Channel: <#${chId}>${textCh ? "" : " *(channel not found — may have been deleted)*"}\n` +
+              `Times: 00:00, 05:00, 10:00, 15:00, 20:00 UTC (5×/day)\n` +
+              `Use \`/jokeschedule off\` to stop.`,
+            );
+          }
+          return;
+        }
+      }
+
       // ── /addtwitter ────────────────────────────────────────────────────────
       if (commandName === "addtwitter") {
         const username = interaction.options.getString("username", true);
@@ -1908,18 +2241,27 @@ function handleInteractions(client: Client): void {
         const lines = list.map(a => {
           let icon = "✅";
           let note = "";
+          let errLine = "";
           if (a.unreachable) {
             icon = "🔴";
-            note = " *(unreachable — all RSS sources dead)*";
+            note = " *(unreachable — all sources failed)*";
+            if (a.lastError) errLine = `\n  └ \`${a.lastError.slice(0, 120)}\``;
           } else if (a.failCount >= FAILURE_THRESHOLD) {
             icon = "⚠️";
-            note = ` *(${a.failCount} fetch errors — retrying every 6h)*`;
+            note = ` *(${a.failCount} errors — retrying every 6h)*`;
+            if (a.lastError) errLine = `\n  └ \`${a.lastError.slice(0, 120)}\``;
+          } else if (!a.lastTweetId) {
+            icon = "🟡";
+            note = " *(monitoring — no tweet captured yet)*";
           }
-          return `${icon} **@${a.username}** → <#${a.channelId}>${note}`;
+          return `${icon} **@${a.username}** → <#${a.channelId}>${note}${errLine}`;
         }).join("\n");
         const hasIssues = list.some(a => a.failCount >= FAILURE_THRESHOLD || a.unreachable);
+        const hasUnseeded = list.some(a => !a.lastTweetId && !a.unreachable);
         const footer = hasIssues
-          ? "\n\n⚠️ *Some accounts can't be reached — Nitter RSS sources may be temporarily blocked. Monitoring will auto-resume when they're back.*"
+          ? "\n\n⚠️ *Use `/twitterreset` to retry all accounts immediately, then `/twitterpoll` to diagnose.*"
+          : hasUnseeded
+          ? "\n\n🟡 *Yellow accounts haven't had a tweet captured yet — Twitter may not expose them via free APIs.*"
           : "";
         await interaction.editReply(`📋 **Monitored accounts (${list.length}):**\n${lines}${footer}`);
         return;
