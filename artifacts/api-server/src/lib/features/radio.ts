@@ -33,8 +33,16 @@ import {
   getVoiceConnection,
   StreamType,
   NoSubscriberBehavior,
+  type VoiceConnection,
 } from "@discordjs/voice";
+
 import { pool } from "@workspace/db";
+
+function safeDestroy(conn: VoiceConnection): void {
+  if (conn.state.status !== VoiceConnectionStatus.Destroyed) {
+    conn.destroy();
+  }
+}
 
 // ─── Built-in stations ────────────────────────────────────────────────────────
 // All URLs verified reachable from cloud IPs (Render/AWS) — last audit 2026-03-26
@@ -200,7 +208,7 @@ export async function startRadio(client: Client, guildId: string): Promise<void>
     const stale = getVoiceConnection(guildId);
     if (stale) {
       stale.removeAllListeners();
-      stale.destroy();
+      safeDestroy(stale);
     }
     const oldPlayer = audioPlayers.get(guildId);
     if (oldPlayer) {
@@ -268,7 +276,7 @@ export async function startRadio(client: Client, guildId: string): Promise<void>
       try {
         await entersState(connection, VoiceConnectionStatus.Connecting, 5_000);
       } catch {
-        connection.destroy();
+        safeDestroy(connection);
         audioPlayers.delete(guildId);
         if (!state.stopped) setTimeout(() => startRadio(client, guildId), 10_000);
       }
@@ -305,7 +313,7 @@ export async function stopRadio(guildId: string): Promise<void> {
   if (player) { player.removeAllListeners(); player.stop(true); audioPlayers.delete(guildId); }
 
   const conn = getVoiceConnection(guildId);
-  if (conn) { conn.removeAllListeners(); conn.destroy(); }
+  if (conn) { conn.removeAllListeners(); safeDestroy(conn); }
 
   // Clear retry state so next /radioplay starts fresh
   streamFailCount.delete(guildId);
