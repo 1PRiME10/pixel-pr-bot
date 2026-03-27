@@ -5,7 +5,8 @@ services:
     # Root dir is the repo root so pnpm workspace commands work correctly
     rootDir: .
     buildCommand: pnpm install --frozen-lockfile && pnpm --filter @workspace/api-server run build
-    startCommand: node --enable-source-maps ./artifacts/api-server/dist/index.mjs
+    startCommand: node --enable-source-maps --max-old-space-size=384 ./artifacts/api-server/dist/index.mjs
+    healthCheckPath: /health
     # Cache both the pnpm store and the resolved node_modules tree between deploys.
     # This avoids re-downloading ~565 MB of packages on every push.
     buildCacheDirectories:

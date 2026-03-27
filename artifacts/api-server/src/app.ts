@@ -15,6 +15,12 @@ app.get("/api/dashboard/*splat", (_req, res) => res.redirect(301, "/api/control"
 app.get("/bot-dashboard", (_req, res) => res.redirect(301, "/api/control"));
 app.get("/bot-dashboard/*splat", (_req, res) => res.redirect(301, "/api/control"));
 
+// ── Lightweight health-check — used by Render + uptime monitors ──────────────
+// Must respond in <1s and NEVER depend on Discord/DB availability.
+app.get("/health", (_req, res) => {
+  res.status(200).json({ status: "ok", ts: Date.now() });
+});
+
 app.get("/", (_req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!DOCTYPE html>
