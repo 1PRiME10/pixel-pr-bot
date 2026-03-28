@@ -1,6 +1,6 @@
 // ─── RSS News Monitor ─────────────────────────────────────────────────────────
-// Polls official Arabic / International / Japanese news RSS feeds every 15 min
-// and posts breaking news to configured Discord channels.
+// Polls official Arabic / International / Japanese news RSS feeds every 5 min
+// and posts breaking news to per-category Discord channels.
 // No API key required — uses public RSS feeds directly from official sources.
 
 import {
@@ -121,13 +121,21 @@ const rssParser = new Parser({
 export async function initNewsMonitor(): Promise<void> {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS news_feed_config (
-      id         SERIAL PRIMARY KEY,
-      guild_id   TEXT NOT NULL UNIQUE,
-      channel_id TEXT NOT NULL,
-      enabled    BOOLEAN NOT NULL DEFAULT TRUE,
-      created_at TIMESTAMPTZ DEFAULT NOW()
+      id            SERIAL PRIMARY KEY,
+      guild_id      TEXT NOT NULL UNIQUE,
+      channel_id    TEXT NOT NULL DEFAULT '',
+      channel_id_ar TEXT,
+      channel_id_en TEXT,
+      channel_id_ja TEXT,
+      enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at    TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+
+  // Migrate: add per-lang columns if they don't exist yet
+  await pool.query(`ALTER TABLE news_feed_config ADD COLUMN IF NOT EXISTS channel_id_ar TEXT`);
+  await pool.query(`ALTER TABLE news_feed_config ADD COLUMN IF NOT EXISTS channel_id_en TEXT`);
+  await pool.query(`ALTER TABLE news_feed_config ADD COLUMN IF NOT EXISTS channel_id_ja TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS news_articles_seen (
@@ -138,7 +146,6 @@ export async function initNewsMonitor(): Promise<void> {
     )
   `);
 
-  // Clean up old seen articles (older than 7 days) to keep table small
   await pool.query(`
     DELETE FROM news_articles_seen
     WHERE seen_at < NOW() - INTERVAL '7 days'
@@ -146,14 +153,39 @@ export async function initNewsMonitor(): Promise<void> {
 }
 
 // ─── Set / clear guild config ─────────────────────────────────────────────────
-export async function setNewsChannel(guildId: string, channelId: string): Promise<void> {
+export interface NewsChannels {
+  ar?: string | null;
+  en?: string | null;
+  ja?: string | null;
+}
+
+export async function setNewsChannel(guildId: string, channels: NewsChannels): Promise<void> {
+  // Ensure row exists
   await pool.query(`
     INSERT INTO news_feed_config (guild_id, channel_id, enabled)
-    VALUES ($1, $2, TRUE)
-    ON CONFLICT (guild_id) DO UPDATE
-      SET channel_id = EXCLUDED.channel_id,
-          enabled    = TRUE
-  `, [guildId, channelId]);
+    VALUES ($1, '', TRUE)
+    ON CONFLICT (guild_id) DO UPDATE SET enabled = TRUE
+  `, [guildId]);
+
+  // Update only the provided channels
+  if (channels.ar !== undefined) {
+    await pool.query(
+      `UPDATE news_feed_config SET channel_id_ar = $1 WHERE guild_id = $2`,
+      [channels.ar, guildId]
+    );
+  }
+  if (channels.en !== undefined) {
+    await pool.query(
+      `UPDATE news_feed_config SET channel_id_en = $1 WHERE guild_id = $2`,
+      [channels.en, guildId]
+    );
+  }
+  if (channels.ja !== undefined) {
+    await pool.query(
+      `UPDATE news_feed_config SET channel_id_ja = $1 WHERE guild_id = $2`,
+      [channels.ja, guildId]
+    );
+  }
 }
 
 export async function stopNewsAlerts(guildId: string): Promise<boolean> {
@@ -164,12 +196,26 @@ export async function stopNewsAlerts(guildId: string): Promise<boolean> {
   return (rowCount ?? 0) > 0;
 }
 
-export async function getNewsConfig(guildId: string): Promise<{ channelId: string; enabled: boolean } | null> {
+export interface NewsConfig {
+  channelIdAr: string | null;
+  channelIdEn: string | null;
+  channelIdJa: string | null;
+  enabled:     boolean;
+}
+
+export async function getNewsConfig(guildId: string): Promise<NewsConfig | null> {
   const { rows } = await pool.query(
-    `SELECT channel_id, enabled FROM news_feed_config WHERE guild_id = $1`,
+    `SELECT channel_id_ar, channel_id_en, channel_id_ja, enabled
+     FROM news_feed_config WHERE guild_id = $1`,
     [guildId]
   );
-  return rows[0] ? { channelId: rows[0].channel_id, enabled: rows[0].enabled } : null;
+  if (!rows[0]) return null;
+  return {
+    channelIdAr: rows[0].channel_id_ar ?? null,
+    channelIdEn: rows[0].channel_id_en ?? null,
+    channelIdJa: rows[0].channel_id_ja ?? null,
+    enabled:     rows[0].enabled,
+  };
 }
 
 // ─── Fetch one source ─────────────────────────────────────────────────────────
@@ -240,9 +286,9 @@ async function markAsSeen(items: NewsItem[]): Promise<void> {
 // ─── Build embed for one article ─────────────────────────────────────────────
 function buildEmbed(item: NewsItem): { embed: EmbedBuilder; row: ActionRowBuilder<ButtonBuilder> } {
   const src = item.source;
-  const langLabel = src.lang === "ar" ? "🗞️ أخبار عاجلة" :
-                    src.lang === "ja" ? "🗞️ Breaking News Japan" :
-                    "🗞️ Breaking News";
+  const langLabel = src.lang === "ar" ? "🗞️ Breaking News — Arabic" :
+                    src.lang === "ja" ? "🗞️ Breaking News — Japan" :
+                    "🗞️ Breaking News — International";
 
   const embed = new EmbedBuilder()
     .setColor(src.color)
@@ -256,7 +302,7 @@ function buildEmbed(item: NewsItem): { embed: EmbedBuilder; row: ActionRowBuilde
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setLabel("اقرأ المزيد / Read More")
+      .setLabel("Read More")
       .setStyle(ButtonStyle.Link)
       .setURL(item.link)
       .setEmoji("🔗")
@@ -265,39 +311,55 @@ function buildEmbed(item: NewsItem): { embed: EmbedBuilder; row: ActionRowBuilde
   return { embed, row };
 }
 
-// ─── Post new articles to all configured guilds ───────────────────────────────
+// ─── Post new articles — route each article to its language channel ───────────
 async function postNewsToGuilds(client: Client, newItems: NewsItem[]): Promise<void> {
   if (!newItems.length) return;
 
   const { rows: configs } = await pool.query(
-    `SELECT guild_id, channel_id FROM news_feed_config WHERE enabled = TRUE`
+    `SELECT guild_id, channel_id_ar, channel_id_en, channel_id_ja
+     FROM news_feed_config WHERE enabled = TRUE`
   );
   if (!configs.length) return;
 
   for (const cfg of configs) {
-    try {
-      const channel = await client.channels.fetch(cfg.channel_id).catch(() => null) as TextChannel | null;
-      if (!channel?.isTextBased()) continue;
+    // Build a map: channelId → items to post there
+    const channelMap = new Map<string, NewsItem[]>();
 
-      for (const item of newItems) {
-        try {
-          const { embed, row } = buildEmbed(item);
-          await channel.send({ embeds: [embed], components: [row] });
-          // Small delay between articles to avoid rate limits
-          await new Promise(r => setTimeout(r, 800));
-        } catch (err: any) {
-          console.warn(`[NewsMonitor] Failed to post article "${item.title.slice(0,40)}": ${err.message}`);
+    for (const item of newItems) {
+      const channelId =
+        item.source.lang === "ar" ? cfg.channel_id_ar :
+        item.source.lang === "en" ? cfg.channel_id_en :
+        item.source.lang === "ja" ? cfg.channel_id_ja : null;
+
+      if (!channelId) continue; // No channel configured for this language
+
+      if (!channelMap.has(channelId)) channelMap.set(channelId, []);
+      channelMap.get(channelId)!.push(item);
+    }
+
+    for (const [channelId, items] of channelMap.entries()) {
+      try {
+        const channel = await client.channels.fetch(channelId).catch(() => null) as TextChannel | null;
+        if (!channel?.isTextBased()) continue;
+
+        for (const item of items) {
+          try {
+            const { embed, row } = buildEmbed(item);
+            await channel.send({ embeds: [embed], components: [row] });
+            await new Promise(r => setTimeout(r, 800));
+          } catch (err: any) {
+            console.warn(`[NewsMonitor] Failed to post article "${item.title.slice(0,40)}": ${err.message}`);
+          }
         }
+      } catch (err: any) {
+        console.warn(`[NewsMonitor] Failed to fetch channel ${channelId}: ${err.message}`);
       }
-    } catch (err: any) {
-      console.warn(`[NewsMonitor] Failed to fetch channel ${cfg.channel_id}: ${err.message}`);
     }
   }
 }
 
 // ─── Main poll cycle ──────────────────────────────────────────────────────────
 async function runNewsPollCycle(client: Client): Promise<void> {
-  // Advisory lock — only one instance polls at a time
   const { rows: lockRows } = await pool.query(
     `SELECT pg_try_advisory_lock($1) AS acquired`, [LOCK_KEY]
   );
@@ -305,11 +367,12 @@ async function runNewsPollCycle(client: Client): Promise<void> {
 
   try {
     const { rows: configs } = await pool.query(
-      `SELECT 1 FROM news_feed_config WHERE enabled = TRUE LIMIT 1`
+      `SELECT 1 FROM news_feed_config WHERE enabled = TRUE
+       AND (channel_id_ar IS NOT NULL OR channel_id_en IS NOT NULL OR channel_id_ja IS NOT NULL)
+       LIMIT 1`
     );
-    if (!configs.length) return; // No guilds configured — skip fetching
+    if (!configs.length) return;
 
-    // Fetch all sources in parallel
     const allResults = await Promise.allSettled(
       NEWS_SOURCES.map(src => fetchSourceNews(src))
     );
@@ -321,17 +384,14 @@ async function runNewsPollCycle(client: Client): Promise<void> {
 
     if (!allItems.length) return;
 
-    // Filter unseen & post
     const newItems = await filterUnseen(allItems);
     if (!newItems.length) {
       console.log(`[NewsMonitor] Poll complete — 0 new articles`);
       return;
     }
 
-    // Mark as seen BEFORE posting (avoid duplicates on retry)
     await markAsSeen(newItems);
 
-    // Sort by pubDate (oldest first so Discord feed reads top-to-bottom chronologically)
     newItems.sort((a, b) => {
       const ta = a.pubDate?.getTime() ?? 0;
       const tb = b.pubDate?.getTime() ?? 0;
@@ -350,9 +410,8 @@ async function runNewsPollCycle(client: Client): Promise<void> {
 export function registerNewsMonitor(client: Client): void {
   initNewsMonitor()
     .then(async () => {
-      console.log("[NewsMonitor] Initialized — starting poll loop (every 15 min)");
+      console.log("[NewsMonitor] Initialized — starting poll loop (every 5 min)");
 
-      // Initial poll after 30s delay (give bot time to fully connect)
       setTimeout(() => {
         runNewsPollCycle(client).catch(e =>
           console.error("[NewsMonitor] Initial poll error:", e)
