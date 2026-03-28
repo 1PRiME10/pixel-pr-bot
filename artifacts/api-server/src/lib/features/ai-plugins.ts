@@ -120,11 +120,21 @@ export const aiPluginCommands: AIPlugin[] = [
       .setDescription("Breaking news from official Arabic, international & Japanese sources.")
       .addSubcommand(sub =>
         sub.setName("set")
-          .setDescription("Set the channel where breaking news will be posted.")
+          .setDescription("Set channels per region — Arabic, International & Japanese separately.")
           .addChannelOption(o =>
-            o.setName("channel")
-             .setDescription("Text channel to receive breaking news")
-             .setRequired(true)
+            o.setName("arabic-channel")
+             .setDescription("Channel for Arabic news (Al Jazeera, BBC Arabic, Sky News Arabia, RT Arabic)")
+             .setRequired(false)
+          )
+          .addChannelOption(o =>
+            o.setName("international-channel")
+             .setDescription("Channel for international news (Reuters, BBC World, AP News)")
+             .setRequired(false)
+          )
+          .addChannelOption(o =>
+            o.setName("japanese-channel")
+             .setDescription("Channel for Japanese news (NHK World, The Japan Times)")
+             .setRequired(false)
           )
       )
       .addSubcommand(sub =>
@@ -158,41 +168,59 @@ export const aiPluginCommands: AIPlugin[] = [
         // ── /news-alerts set ──────────────────────────────────────────────────
         if (sub === "set") {
           await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-          const channel = interaction.options.getChannel("channel", true) as any;
 
-          if (!channel.isTextBased() || channel.isVoiceBased()) {
-            await interaction.editReply({ content: `❌ <#${channel.id}> is not a text channel.` });
+          const arCh   = interaction.options.getChannel("arabic-channel")       as any ?? null;
+          const enCh   = interaction.options.getChannel("international-channel") as any ?? null;
+          const jaCh   = interaction.options.getChannel("japanese-channel")     as any ?? null;
+
+          if (!arCh && !enCh && !jaCh) {
+            await interaction.editReply({
+              content: "❌ Please provide at least one channel (Arabic, International, or Japanese).",
+            });
             return;
           }
 
-          await setNewsChannel(guildId, channel.id);
+          // Validate all provided channels are text channels
+          for (const ch of [arCh, enCh, jaCh]) {
+            if (ch && (!ch.isTextBased() || ch.isVoiceBased())) {
+              await interaction.editReply({ content: `❌ <#${ch.id}> is not a text channel.` });
+              return;
+            }
+          }
 
-          const arabicSources    = NEWS_SOURCES.filter(s => s.lang === "ar");
-          const intlSources      = NEWS_SOURCES.filter(s => s.lang === "en");
-          const japaneseSources  = NEWS_SOURCES.filter(s => s.lang === "ja");
+          await setNewsChannel(guildId, {
+            ar: arCh?.id ?? undefined,
+            en: enCh?.id ?? undefined,
+            ja: jaCh?.id ?? undefined,
+          });
+
+          const arabicSources   = NEWS_SOURCES.filter(s => s.lang === "ar");
+          const intlSources     = NEWS_SOURCES.filter(s => s.lang === "en");
+          const japaneseSources = NEWS_SOURCES.filter(s => s.lang === "ja");
+
+          const fields: { name: string; value: string; inline: boolean }[] = [];
+          if (arCh) fields.push({
+            name: "🌍 Arabic News → " + `#${arCh.name}`,
+            value: arabicSources.map(s => `${s.flag} ${s.name}`).join("\n"),
+            inline: true,
+          });
+          if (enCh) fields.push({
+            name: "🌐 International News → " + `#${enCh.name}`,
+            value: intlSources.map(s => `${s.flag} ${s.name}`).join("\n"),
+            inline: true,
+          });
+          if (jaCh) fields.push({
+            name: "🇯🇵 Japanese News → " + `#${jaCh.name}`,
+            value: japaneseSources.map(s => `${s.flag} ${s.name}`).join("\n"),
+            inline: true,
+          });
 
           const embed = new EmbedBuilder()
             .setColor(Colors.Green)
-            .setTitle("📰 News Alerts Activated")
-            .setDescription(`Breaking news will be posted in <#${channel.id}> every **5 minutes** automatically.`)
-            .addFields(
-              {
-                name: "🌍 Arabic Sources",
-                value: arabicSources.map(s => `${s.flag} ${s.name}`).join("\n"),
-                inline: true,
-              },
-              {
-                name: "🌐 International Sources",
-                value: intlSources.map(s => `${s.flag} ${s.name}`).join("\n"),
-                inline: true,
-              },
-              {
-                name: "🇯🇵 Japanese Sources",
-                value: japaneseSources.map(s => `${s.flag} ${s.name}`).join("\n"),
-                inline: true,
-              },
-            )
-            .setFooter({ text: "Live news from official sources — no Twitter required" });
+            .setTitle("📰 News Alerts Configured")
+            .setDescription("Breaking news will be posted every **5 minutes** to the channels below.")
+            .addFields(...fields)
+            .setFooter({ text: "Only configured categories will receive news." });
 
           await interaction.editReply({ embeds: [embed] });
 
@@ -219,18 +247,17 @@ export const aiPluginCommands: AIPlugin[] = [
           }
 
           const statusEmoji = config.enabled ? "✅ Active" : "⛔ Stopped";
+          const channelFields: { name: string; value: string; inline: boolean }[] = [
+            { name: "Status",  value: statusEmoji, inline: false },
+            { name: "🌍 Arabic Channel",        value: config.channelIdAr ? `<#${config.channelIdAr}>` : "Not set", inline: true },
+            { name: "🌐 International Channel",  value: config.channelIdEn ? `<#${config.channelIdEn}>` : "Not set", inline: true },
+            { name: "🇯🇵 Japanese Channel",      value: config.channelIdJa ? `<#${config.channelIdJa}>` : "Not set", inline: true },
+          ];
+
           const embed = new EmbedBuilder()
             .setColor(config.enabled ? Colors.Green : Colors.Red)
             .setTitle("📰 News Alerts Status")
-            .addFields(
-              { name: "Status",  value: statusEmoji,                           inline: true },
-              { name: "Channel", value: `<#${config.channelId}>`,              inline: true },
-              { name: "Sources", value: `${NEWS_SOURCES.length} official`,     inline: true },
-              {
-                name: "All Sources",
-                value: NEWS_SOURCES.map(s => `${s.flag} ${s.name}`).join(" • "),
-              },
-            )
+            .addFields(...channelFields)
             .setFooter({ text: "Checks every 5 minutes — breaking news from official websites" });
 
           await interaction.editReply({ embeds: [embed] });
@@ -258,11 +285,21 @@ export const aiPluginCommands: AIPlugin[] = [
       .setDescription("Anime, international film/TV & Korean drama news from official RSS sources.")
       .addSubcommand(sub =>
         sub.setName("set")
-          .setDescription("Set the channel where entertainment news will be posted.")
+          .setDescription("Set channels per category — Anime, Film/TV & Korean separately.")
           .addChannelOption(o =>
-            o.setName("channel")
-             .setDescription("Text channel to receive TV & anime news")
-             .setRequired(true)
+            o.setName("anime-channel")
+             .setDescription("Channel for anime & manga news (MyAnimeList, Anime Corner, Otaku USA, Comic Natalie)")
+             .setRequired(false)
+          )
+          .addChannelOption(o =>
+            o.setName("film-channel")
+             .setDescription("Channel for international film & TV news (Deadline, Variety, Collider, Screen Rant)")
+             .setRequired(false)
+          )
+          .addChannelOption(o =>
+            o.setName("korean-channel")
+             .setDescription("Channel for Korean drama & K-pop news (Soompi, Dramabeans, Koreaboo)")
+             .setRequired(false)
           )
       )
       .addSubcommand(sub =>
@@ -296,41 +333,58 @@ export const aiPluginCommands: AIPlugin[] = [
         // ── /tv-news set ──────────────────────────────────────────────────────
         if (sub === "set") {
           await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-          const channel = interaction.options.getChannel("channel", true) as any;
 
-          if (!channel.isTextBased() || channel.isVoiceBased()) {
-            await interaction.editReply({ content: `❌ <#${channel.id}> is not a text channel.` });
+          const animeCh = interaction.options.getChannel("anime-channel")  as any ?? null;
+          const filmCh  = interaction.options.getChannel("film-channel")   as any ?? null;
+          const krCh    = interaction.options.getChannel("korean-channel") as any ?? null;
+
+          if (!animeCh && !filmCh && !krCh) {
+            await interaction.editReply({
+              content: "❌ Please provide at least one channel (Anime, Film/TV, or Korean).",
+            });
             return;
           }
 
-          await setTVNewsChannel(guildId, channel.id);
+          for (const ch of [animeCh, filmCh, krCh]) {
+            if (ch && (!ch.isTextBased() || ch.isVoiceBased())) {
+              await interaction.editReply({ content: `❌ <#${ch.id}> is not a text channel.` });
+              return;
+            }
+          }
+
+          await setTVNewsChannel(guildId, {
+            anime: animeCh?.id ?? undefined,
+            intl:  filmCh?.id  ?? undefined,
+            kr:    krCh?.id    ?? undefined,
+          });
 
           const animeSrcs = TV_SOURCES.filter(s => s.lang === "anime");
           const intlSrcs  = TV_SOURCES.filter(s => s.lang === "intl");
           const krSrcs    = TV_SOURCES.filter(s => s.lang === "kr");
 
+          const fields: { name: string; value: string; inline: boolean }[] = [];
+          if (animeCh) fields.push({
+            name: `🎌 Anime & Manga → #${animeCh.name}`,
+            value: animeSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
+            inline: true,
+          });
+          if (filmCh) fields.push({
+            name: `🎬 Film & TV → #${filmCh.name}`,
+            value: intlSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
+            inline: true,
+          });
+          if (krCh) fields.push({
+            name: `🇰🇷 Korean → #${krCh.name}`,
+            value: krSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
+            inline: true,
+          });
+
           const embed = new EmbedBuilder()
             .setColor(0xE91E8C)
-            .setTitle("📺 TV & Anime News Activated")
-            .setDescription(`Anime, film & Korean drama news will be posted in <#${channel.id}> every **5 minutes**.`)
-            .addFields(
-              {
-                name: "🎌 Anime / Japanese",
-                value: animeSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
-                inline: true,
-              },
-              {
-                name: "🎬 Film & TV",
-                value: intlSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
-                inline: true,
-              },
-              {
-                name: "🇰🇷 Korean",
-                value: krSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
-                inline: true,
-              },
-            )
-            .setFooter({ text: `${TV_SOURCES.length} official sources — new seasons, releases & breaking news` });
+            .setTitle("📺 TV & Anime News Configured")
+            .setDescription("News will be posted every **5 minutes** to the channels below.")
+            .addFields(...fields)
+            .setFooter({ text: "Only configured categories will receive news." });
 
           await interaction.editReply({ embeds: [embed] });
 
@@ -361,21 +415,10 @@ export const aiPluginCommands: AIPlugin[] = [
             .setColor(config.enabled ? Colors.Green : Colors.Red)
             .setTitle("📺 TV & Anime News Status")
             .addFields(
-              { name: "Status",  value: statusEmoji,                         inline: true },
-              { name: "Channel", value: `<#${config.channelId}>`,            inline: true },
-              { name: "Sources", value: `${TV_SOURCES.length} official`,     inline: true },
-              {
-                name: "🎌 Anime",
-                value: TV_SOURCES.filter(s => s.lang === "anime").map(s => `${s.flag} ${s.name}`).join(" • "),
-              },
-              {
-                name: "🎬 Film & TV",
-                value: TV_SOURCES.filter(s => s.lang === "intl").map(s => `${s.flag} ${s.name}`).join(" • "),
-              },
-              {
-                name: "🇰🇷 Korean",
-                value: TV_SOURCES.filter(s => s.lang === "kr").map(s => `${s.flag} ${s.name}`).join(" • "),
-              },
+              { name: "Status", value: statusEmoji, inline: false },
+              { name: "🎌 Anime Channel",   value: config.channelIdAnime ? `<#${config.channelIdAnime}>` : "Not set", inline: true },
+              { name: "🎬 Film/TV Channel", value: config.channelIdIntl  ? `<#${config.channelIdIntl}>`  : "Not set", inline: true },
+              { name: "🇰🇷 Korean Channel", value: config.channelIdKr    ? `<#${config.channelIdKr}>`    : "Not set", inline: true },
             )
             .setFooter({ text: "Checks every 5 minutes from official RSS feeds" });
 
