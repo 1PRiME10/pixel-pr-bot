@@ -505,6 +505,18 @@ export async function applyManualFix(
   suggestion:    string,
   errorContext:  string = "manual",
 ): Promise<AutoFixResult> {
+  // On Render, source .ts files are not deployed — only the compiled dist/ exists.
+  // Code fixes must be made in the development environment (Replit) and deployed.
+  if (process.env.RENDER) {
+    return {
+      applied:     false,
+      description: "Code fixes are not available on the deployment server.\n" +
+                   "Source files only exist in the development environment.\n" +
+                   "Make this change in Replit and deploy manually from the Render dashboard.",
+      status:      "no_file",
+    };
+  }
+
   const resolved = resolveTargetPath(targetFileRel);
   if (!resolved) {
     return { applied: false, description: `File not found: ${targetFileRel}`, status: "no_file" };
