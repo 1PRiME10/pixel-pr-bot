@@ -13,6 +13,7 @@ import {
   SlashCommandBuilder,
   PermissionFlagsBits,
   EmbedBuilder,
+  Colors,
   ChatInputCommandInteraction,
   GuildMember,
   TextChannel,
@@ -2237,33 +2238,53 @@ function handleInteractions(client: Client): void {
         const gid  = interaction.guildId!;
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const list = await listTwitterAccounts(gid);
-        if (!list.length) { await interaction.editReply("📭 No Twitter/X accounts are being monitored.\nUse `/addtwitter` to add one."); return; }
-        const lines = list.map(a => {
+        if (!list.length) {
+          await interaction.editReply("📭 No Twitter/X accounts are being monitored.\nUse `/addtwitter` to add one.");
+          return;
+        }
+
+        const healthy   = list.filter(a => !a.unreachable && a.failCount < FAILURE_THRESHOLD);
+        const failing   = list.filter(a => !a.unreachable && a.failCount >= FAILURE_THRESHOLD);
+        const dead      = list.filter(a => a.unreachable);
+        const unseeded  = healthy.filter(a => !a.lastTweetId);
+
+        const fmtAccount = (a: typeof list[0]) => {
           let icon = "✅";
-          let note = "";
-          let errLine = "";
-          if (a.unreachable) {
-            icon = "🔴";
-            note = " *(unreachable — all sources failed)*";
-            if (a.lastError) errLine = `\n  └ \`${a.lastError.slice(0, 120)}\``;
-          } else if (a.failCount >= FAILURE_THRESHOLD) {
-            icon = "⚠️";
-            note = ` *(${a.failCount} errors — retrying every 6h)*`;
-            if (a.lastError) errLine = `\n  └ \`${a.lastError.slice(0, 120)}\``;
-          } else if (!a.lastTweetId) {
-            icon = "🟡";
-            note = " *(monitoring — no tweet captured yet)*";
-          }
-          return `${icon} **@${a.username}** → <#${a.channelId}>${note}${errLine}`;
-        }).join("\n");
-        const hasIssues = list.some(a => a.failCount >= FAILURE_THRESHOLD || a.unreachable);
-        const hasUnseeded = list.some(a => !a.lastTweetId && !a.unreachable);
-        const footer = hasIssues
-          ? "\n\n⚠️ *Use `/twitterreset` to retry all accounts immediately, then `/twitterpoll` to diagnose.*"
-          : hasUnseeded
-          ? "\n\n🟡 *Yellow accounts haven't had a tweet captured yet — Twitter may not expose them via free APIs.*"
-          : "";
-        await interaction.editReply(`📋 **Monitored accounts (${list.length}):**\n${lines}${footer}`);
+          if (a.unreachable)                       icon = "🔴";
+          else if (a.failCount >= FAILURE_THRESHOLD) icon = "⚠️";
+          else if (!a.lastTweetId)                  icon = "🟡";
+          return `${icon} **@${a.username}** → <#${a.channelId}>`;
+        };
+
+        const embed = new EmbedBuilder()
+          .setColor(failing.length || dead.length ? Colors.Orange : Colors.Green)
+          .setTitle(`🐦 Monitored X / Twitter (${list.length} accounts)`)
+          .setTimestamp();
+
+        if (healthy.length)
+          embed.addFields({ name: `✅ Active (${healthy.length})`, value: healthy.map(fmtAccount).join("\n"), inline: false });
+        if (failing.length) {
+          const failLines = failing.map(a => {
+            const err = a.lastError ? `\n  └ \`${a.lastError.slice(0, 80)}\`` : "";
+            return `⚠️ **@${a.username}** → <#${a.channelId}> *(${a.failCount} errors)*${err}`;
+          }).join("\n");
+          embed.addFields({ name: `⚠️ Failing (${failing.length}) — retry with /twitterreset`, value: failLines.slice(0, 1020), inline: false });
+        }
+        if (dead.length) {
+          const deadLines = dead.map(a => {
+            const err = a.lastError ? `\n  └ \`${a.lastError.slice(0, 80)}\`` : "";
+            return `🔴 **@${a.username}** → <#${a.channelId}>${err}`;
+          }).join("\n");
+          embed.addFields({ name: `🔴 Unreachable (${dead.length})`, value: deadLines.slice(0, 1020), inline: false });
+        }
+
+        const tips: string[] = [];
+        if (failing.length) tips.push("• Use `/twitterreset` to retry all failing accounts immediately");
+        if (failing.length) tips.push("• Use `/twitterpoll username:X` to see the exact error for any account");
+        if (unseeded.length) tips.push("• 🟡 accounts are monitored but no tweet captured yet (normal for new/quiet accounts)");
+        if (tips.length) embed.setFooter({ text: tips.join("\n") });
+
+        await interaction.editReply({ embeds: [embed] });
         return;
       }
 
