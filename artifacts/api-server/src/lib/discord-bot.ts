@@ -32,8 +32,10 @@ import { registerAutoSecurity, initAutoSecurity } from "./features/auto-security
 import { registerProfanityFilter, initProfanityFilter } from "./features/profanity-filter.js";
 import { registerServerLog, initServerLog } from "./features/server-log.js";
 import { registerTweetMonitor, initTweetMonitor } from "./features/tweet-monitor.js";
+import { registerJokeScheduler, initJokeScheduler } from "./features/joke-scheduler.js";
 import { registerWelcome, initWelcome } from "./features/welcome.js";
-import { registerRadio, initRadio, startRadio } from "./features/radio.js";
+import { registerRadio, initRadio, startRadio, radioStates } from "./features/radio.js";
+import { registerVoiceAI, initVoiceAISettings } from "./features/voice-ai.js";
 import { registerAesthetic } from "./features/aesthetic.js";
 import { registerSentiment } from "./features/sentiment.js";
 import { registerSteganography } from "./features/steganography.js";
@@ -86,6 +88,12 @@ const MAX_RECONNECT_DELAY_MS = 300_000; // 5 minutes max
 let reconnectPending = false;
 let watchdogInterval: ReturnType<typeof setInterval> | null = null;
 let connectStartTime = 0; // tracks when the last connect() started
+// ── Leak prevention: track reconnect-spawned intervals so we can clear them ──
+// Every connect() spawns a status-cycle and (optionally) a schedule ticker.
+// Without clearing them, each reconnect adds two permanent intervals that
+// reference a stale client object — CPU + memory leak over time.
+let statusCycleIntervalRef: ReturnType<typeof setInterval> | null = null;
+let scheduledBehaviorsIntervalRef: ReturnType<typeof setInterval> | null = null;
 // Tracks whether THIS process is the elected leader.
 // Watchdog MUST NOT reconnect if we're not the leader (another instance owns Discord).
 let isElectedLeader = false;
@@ -155,8 +163,8 @@ interface Turn { role: "user" | "model"; text: string; }
 interface Conversation { history: Turn[]; lastActive: number; }
 
 const conversations = new Map<string, Conversation>();
-const MAX_HISTORY_PAIRS = 15;          // remember last 15 exchanges
-const INACTIVITY_MS = 30 * 60 * 1000; // forget after 30 min inactivity
+const MAX_HISTORY_PAIRS = 10;          // remember last 10 exchanges (reduced from 15 — saves ~33% RAM)
+const INACTIVITY_MS = 20 * 60 * 1000; // forget after 20 min inactivity (reduced from 30 min)
 
 function historyKey(userId: string, guildId: string): string {
   return `${userId}:${guildId}`;
@@ -389,15 +397,49 @@ function getImageAttachment(message: Message): { url: string; mimeType: string }
 const AI_CHAT_COOLDOWN_MS = 8_000;   // 8 seconds between AI replies per user
 const lastAiReplyTime = new Map<string, number>();
 
+// ─── Per-guild AI flood protection ────────────────────────────────────────────
+// Prevents one busy guild from eating all 5 global concurrency slots.
+// Cap: 15 AI calls per 60 s per guild (generous for normal use, blocks floods).
+const GUILD_AI_LIMIT      = 15;
+const GUILD_AI_WINDOW_MS  = 60_000;
+const _guildAiTimestamps  = new Map<string, number[]>();
+
+function isGuildAiRateLimited(guildId: string): boolean {
+  if (guildId === "global") return false; // no limit in DMs
+  const now   = Date.now();
+  const times = (_guildAiTimestamps.get(guildId) ?? []).filter(t => now - t < GUILD_AI_WINDOW_MS);
+  if (times.length >= GUILD_AI_LIMIT) return true;
+  times.push(now);
+  _guildAiTimestamps.set(guildId, times);
+  return false;
+}
+
+// ─── Exported memory-pressure recovery ────────────────────────────────────────
+// Called by the memory watchdog in index.ts when heap is critically high.
+// Clears conversation history for users inactive longer than `olderThanMs`.
+export function clearOldConversations(olderThanMs = INACTIVITY_MS): number {
+  let count = 0;
+  const cutoff = Date.now() - olderThanMs;
+  for (const [key, conv] of conversations.entries()) {
+    if (conv.lastActive < cutoff) { conversations.delete(key); count++; }
+  }
+  return count;
+}
+
 // ─── Periodic memory sweepers ─────────────────────────────────────────────────
-// Both maps grow forever if never cleaned. Sweep every 10 minutes.
+// All maps grow forever if never cleaned. Sweep every 5 minutes (was 10).
 setInterval(() => {
   const now = Date.now();
 
-  // 1. conversations: evict any key inactive for >30 min (already guarded on read,
-  //    but users who leave a server would otherwise stay in RAM indefinitely).
+  // 1. conversations: evict inactive entries + trim oversized histories.
+  //    Trimming handles conversations built under a previous higher MAX_HISTORY_PAIRS limit.
   for (const [key, conv] of conversations.entries()) {
-    if (now - conv.lastActive > INACTIVITY_MS) conversations.delete(key);
+    if (now - conv.lastActive > INACTIVITY_MS) {
+      conversations.delete(key);
+    } else if (conv.history.length > MAX_HISTORY_PAIRS * 2) {
+      // Trim in-place: keep only the most recent MAX_HISTORY_PAIRS * 2 turns
+      conv.history.splice(0, conv.history.length - MAX_HISTORY_PAIRS * 2);
+    }
   }
 
   // 2. lastAiReplyTime: evict entries older than the cooldown window.
@@ -405,10 +447,37 @@ setInterval(() => {
   for (const [uid, ts] of lastAiReplyTime.entries()) {
     if (now - ts > AI_CHAT_COOLDOWN_MS * 2) lastAiReplyTime.delete(uid);
   }
-}, 10 * 60_000);
+
+  // 3. _guildAiTimestamps: evict guilds with no recent AI calls
+  for (const [gid, times] of _guildAiTimestamps.entries()) {
+    const fresh = times.filter(t => now - t < GUILD_AI_WINDOW_MS);
+    if (fresh.length === 0) {
+      _guildAiTimestamps.delete(gid);
+    } else if (fresh.length < times.length) {
+      _guildAiTimestamps.set(gid, fresh); // shrink stale timestamp arrays
+    }
+  }
+}, 5 * 60_000);
 
 // ─── Send PIXEL reply helper ──────────────────────────────────────────────────
+// Concurrency guard: cap simultaneous AI requests to prevent memory pressure & OOM on Render free tier
+let activeAiRequests = 0;
+const AI_MAX_CONCURRENT = 5;
+
 async function sendPixelReply(message: Message, prompt: string) {
+  // ── Per-guild flood guard — prevent one server from eating all AI slots ──
+  const gIdForRateLimit = message.guild?.id ?? "global";
+  if (isGuildAiRateLimited(gIdForRateLimit)) {
+    await message.reply("⏳ Server AI limit reached (15/min) — try again in a moment~").catch(() => {});
+    return;
+  }
+
+  // ── Global concurrency guard — prevent OOM from too many simultaneous AI calls ──
+  if (activeAiRequests >= AI_MAX_CONCURRENT) {
+    await message.reply("⏳ I'm handling a lot of requests right now! Please try again in a moment~").catch(() => {});
+    return;
+  }
+
   // ── Per-user cooldown — silently throttle fast senders ───────────────────
   const userId    = message.author.id;
   const lastReply = lastAiReplyTime.get(userId) ?? 0;
@@ -430,6 +499,7 @@ async function sendPixelReply(message: Message, prompt: string) {
     return;
   }
 
+  activeAiRequests++;
   const keepTyping = setInterval(() => {
     (message.channel as any).sendTyping().catch(() => {});
   }, 8_000);
@@ -493,10 +563,13 @@ async function sendPixelReply(message: Message, prompt: string) {
       }
     }
   } catch (err) {
-    clearInterval(keepTyping);
     console.error("PIXEL sendReply error:", err);
     handleError(err, "sendPixelReply", message.guild?.id).catch(console.error);
-    await message.reply("😅 Something unexpected happened. Please try again!");
+    await message.reply("😅 Something unexpected happened. Please try again!").catch(() => {});
+  } finally {
+    // Always release the concurrency slot and stop the typing indicator — no matter what
+    activeAiRequests--;
+    clearInterval(keepTyping);
   }
 }
 
@@ -542,6 +615,9 @@ function getReconnectDelay(): number {
 // ─── Connect ──────────────────────────────────────────────────────────────────
 async function connect(token: string): Promise<void> {
   connectStartTime = Date.now();
+  // Clear stale reconnect-spawned intervals from the previous session
+  if (statusCycleIntervalRef)      { clearInterval(statusCycleIntervalRef);      statusCycleIntervalRef      = null; }
+  if (scheduledBehaviorsIntervalRef){ clearInterval(scheduledBehaviorsIntervalRef); scheduledBehaviorsIntervalRef = null; }
   if (client) {
     try { client.destroy(); } catch {}
     client = null;
@@ -581,7 +657,10 @@ async function connect(token: string): Promise<void> {
     // Fast WebSocket cleanup during reconnect cycles
     closeTimeout: 1_000,
   });
+  // Raise EventEmitter listener cap to prevent MaxListenersExceeded warnings
+  // after many reconnects (each reconnect re-registers ~15-20 listeners).
   client.setMaxListeners(50);
+  (client.ws as any)?.setMaxListeners?.(50);
 
   // Register client with self-heal + security so they can send reports
   setSelfHealClient(client);
@@ -624,14 +703,16 @@ async function connect(token: string): Promise<void> {
     };
     cycleStatus();
     // Rotate every 3 min — also keeps the WS gateway from going idle
-    setInterval(cycleStatus, 3 * 60_000);
+    // Track ref so we can clear it on the next reconnect (prevents interval leak)
+    statusCycleIntervalRef = setInterval(cycleStatus, 3 * 60_000);
     registerDaily(c);
 
     // ── AI Behavior: schedule tick (fires every minute, matches cron expressions) ──
     const scheduledBehaviors = aiBehaviors.filter(b => b.type === "schedule" && b.schedule);
     if (scheduledBehaviors.length > 0) {
       console.log(`[Behaviors] Registered ${scheduledBehaviors.length} scheduled behavior(s)`);
-      setInterval(() => {
+      // Track ref so we can clear it on the next reconnect (prevents interval leak)
+      scheduledBehaviorsIntervalRef = setInterval(() => {
         const now = new Date();
         for (const behavior of scheduledBehaviors) {
           if (matchesCron(behavior.schedule!, now)) {
@@ -645,6 +726,26 @@ async function connect(token: string): Promise<void> {
     for (const guild of c.guilds.cache.values()) {
       uploadAiEmojis(guild).catch(console.error);
     }
+
+    // ── Auto-restart radio after reconnect ────────────────────────────────
+    // radioStates is a module-level Map (persists across client reconnects).
+    // After a crash / redeploy / WS reconnect, any active station needs to be
+    // restarted. 3 s delay lets guild caches settle before joining voice.
+    setTimeout(async () => {
+      let restarted = 0;
+      for (const [guildId, state] of radioStates.entries()) {
+        if (state.stopped) continue;
+        const guild = c.guilds.cache.get(guildId);
+        if (!guild) continue;
+        try {
+          await startRadio(c, guildId);
+          restarted++;
+        } catch (e) {
+          console.error(`[Radio] Auto-restart failed for guild ${guildId}:`, e);
+        }
+      }
+      if (restarted > 0) console.log(`[Radio] Auto-restarted ${restarted} station(s) after ready`);
+    }, 3_000);
   });
 
   // Upload Ai Hoshino emojis when bot joins a new guild
@@ -734,9 +835,7 @@ async function connect(token: string): Promise<void> {
 
     // Ping spike: >2000ms three times in a row (~45s total) → proactive reconnect.
     // Threshold raised from 600ms to 2000ms because Render free-tier CPU throttling and
-    // concurrent TweetMonitor HTTP requests can temporarily spike WS ping to 600-1500ms
-    // without the connection being actually dead. Firing too early causes a disconnect
-    // loop that makes slash commands show "The application did not respond".
+    // TweetMonitor poll bursts can push ping to 800-1200ms without a real disconnect.
     if (wsPing > 2000) {
       highPingStrikes++;
       console.warn(`[Watchdog] High ping: ${wsPing}ms (strike ${highPingStrikes}/3)`);
@@ -752,7 +851,7 @@ async function connect(token: string): Promise<void> {
 
     // Heartbeat staleness: Discord heartbeats every ~41s.
     // If last ping timestamp is older than 3× the interval → connection frozen.
-    // (Raised from 2.5× to 3× to give more headroom during heavy TweetMonitor cycles.)
+    // Raised from 2.5x to 3x to avoid false positives during CPU-throttled poll cycles.
     const shard = client.ws.shards.first();
     if (shard) {
       const hbInterval = (shard as any).heartbeatInterval ?? 45_000;
@@ -794,8 +893,10 @@ async function connect(token: string): Promise<void> {
   registerProfanityFilter(client);
   registerServerLog(client);
   registerTweetMonitor(client);
+  registerJokeScheduler(client);
   registerWelcome(client);
   registerRadio(client);
+  registerVoiceAI(client);
   registerAesthetic(client, PREFIX);
   registerSentiment(client, PREFIX);
   registerSteganography(client, PREFIX);
@@ -1398,7 +1499,10 @@ function scheduleReconnect(token: string): void {
   const delay = getReconnectDelay();
   reconnectAttempts++;
   console.log(`Reconnecting in ${delay / 1000}s (attempt ${reconnectAttempts})...`);
-  setTimeout(() => { reconnectPending = false; connect(token); }, delay);
+  setTimeout(() => {
+    reconnectPending = false;
+    connect(token).catch(e => console.error("[Reconnect] connect() threw — watchdog will retry:", e));
+  }, delay);
 }
 
 // ─── Leader Election ──────────────────────────────────────────────────────────
@@ -1448,20 +1552,23 @@ function startKeepAlive(): void {
     return;
   }
 
-  const pingUrl = `${base}/api/healthz`;
-  console.log(`[KeepAlive] Pinging ${pingUrl} every 10s to prevent Render free-tier sleep`);
+  // Use the lightweight /health endpoint — zero DB/Discord dependency, responds in <1ms.
+  // Never use /api/healthz here (it runs a DB query on every ping).
+  // Render free tier spins down after 15 min of inactivity — ping every 10 min is safe.
+  const pingUrl = `${base}/health`;
+  console.log(`[KeepAlive] Pinging ${pingUrl} every 10 min to prevent Render free-tier sleep`);
 
   const doPing = async () => {
     try {
       const res = await fetch(pingUrl, { signal: AbortSignal.timeout(8_000) });
-      console.log(`[KeepAlive] Ping → ${res.status}`);
+      if (res.status !== 200) console.warn(`[KeepAlive] Ping → ${res.status}`);
     } catch (e) {
-      console.warn("[KeepAlive] Ping failed (will retry in 10s):", (e as Error)?.message ?? e);
+      console.warn("[KeepAlive] Ping failed:", (e as Error)?.message ?? e);
     }
   };
 
-  doPing();                      // fire immediately — don't wait on cold start
-  setInterval(doPing, 10_000);   // then every 10 seconds
+  doPing();                           // fire immediately on cold start
+  setInterval(doPing, 10 * 60_000);  // then every 10 minutes
 }
 
 async function ensureLeaderTable(): Promise<void> {
@@ -1556,6 +1663,8 @@ export async function initBot(): Promise<void> {
     initChatChannels(),
     initDaily(),
     initTweetMonitor(),
+    initJokeScheduler(),
+    initVoiceAISettings(),
     initAiEmojis(),
     initWelcome(),
     initRadio(),
@@ -1595,12 +1704,19 @@ export async function initBot(): Promise<void> {
     // Fast retry + 8 s stale window = new instance takes Discord in ≤ 10 s after old dies.
     setInterval(async () => {
       if (isElectedLeader) return; // already promoted — stop retrying
-      const won = await tryAcquireLeader();
-      if (won) {
-        console.log(`[Leader] Render standby promoted to leader (pid=${process.pid}). Connecting to Discord...`);
-        isElectedLeader = true;
-        setInterval(() => refreshLeaderLock(), LEADER_HEARTBEAT_MS);
-        await connect(token);
+      try {
+        const won = await tryAcquireLeader();
+        if (won) {
+          console.log(`[Leader] Render standby promoted to leader (pid=${process.pid}). Connecting to Discord...`);
+          isElectedLeader = true;
+          setInterval(() => refreshLeaderLock(), LEADER_HEARTBEAT_MS);
+          await connect(token);
+        }
+      } catch (err) {
+        // Reset flag so the retry loop continues on next tick — prevents permanent lock-up
+        // if connect() throws (e.g. network blip, bad token response).
+        console.error("[Leader] Standby promotion failed — will retry in 2s:", (err as Error)?.message ?? err);
+        isElectedLeader = false;
       }
     }, 2_000);
     return;
