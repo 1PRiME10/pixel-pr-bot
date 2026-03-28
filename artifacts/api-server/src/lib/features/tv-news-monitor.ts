@@ -1,7 +1,6 @@
 // ─── TV & Entertainment News Monitor ─────────────────────────────────────────
 // Monitors official Anime / International Film-TV / Korean Drama RSS feeds
-// every 15 minutes and posts new releases, season announcements & entertainment
-// news to a configured Discord channel.
+// every 5 minutes and posts to separate per-category Discord channels.
 //
 // Sources (all verified public RSS, no API key required):
 //   🎌 Anime  — MyAnimeList, Anime Corner, Otaku USA, Comic Natalie
@@ -140,13 +139,21 @@ const rssParser = new Parser({
 export async function initTVNewsMonitor(): Promise<void> {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tv_news_config (
-      id         SERIAL PRIMARY KEY,
-      guild_id   TEXT NOT NULL UNIQUE,
-      channel_id TEXT NOT NULL,
-      enabled    BOOLEAN NOT NULL DEFAULT TRUE,
-      created_at TIMESTAMPTZ DEFAULT NOW()
+      id               SERIAL PRIMARY KEY,
+      guild_id         TEXT NOT NULL UNIQUE,
+      channel_id       TEXT NOT NULL DEFAULT '',
+      channel_id_anime TEXT,
+      channel_id_intl  TEXT,
+      channel_id_kr    TEXT,
+      enabled          BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at       TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+
+  // Migrate: add per-category columns if they don't exist yet
+  await pool.query(`ALTER TABLE tv_news_config ADD COLUMN IF NOT EXISTS channel_id_anime TEXT`);
+  await pool.query(`ALTER TABLE tv_news_config ADD COLUMN IF NOT EXISTS channel_id_intl  TEXT`);
+  await pool.query(`ALTER TABLE tv_news_config ADD COLUMN IF NOT EXISTS channel_id_kr    TEXT`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tv_news_seen (
@@ -157,21 +164,44 @@ export async function initTVNewsMonitor(): Promise<void> {
     )
   `);
 
-  // Prune old articles (7 days)
   await pool.query(`
     DELETE FROM tv_news_seen WHERE seen_at < NOW() - INTERVAL '7 days'
   `);
 }
 
 // ─── Guild config helpers ─────────────────────────────────────────────────────
-export async function setTVNewsChannel(guildId: string, channelId: string): Promise<void> {
+export interface TVChannels {
+  anime?: string | null;
+  intl?:  string | null;
+  kr?:    string | null;
+}
+
+export async function setTVNewsChannel(guildId: string, channels: TVChannels): Promise<void> {
+  // Ensure row exists
   await pool.query(`
     INSERT INTO tv_news_config (guild_id, channel_id, enabled)
-    VALUES ($1, $2, TRUE)
-    ON CONFLICT (guild_id) DO UPDATE
-      SET channel_id = EXCLUDED.channel_id,
-          enabled    = TRUE
-  `, [guildId, channelId]);
+    VALUES ($1, '', TRUE)
+    ON CONFLICT (guild_id) DO UPDATE SET enabled = TRUE
+  `, [guildId]);
+
+  if (channels.anime !== undefined) {
+    await pool.query(
+      `UPDATE tv_news_config SET channel_id_anime = $1 WHERE guild_id = $2`,
+      [channels.anime, guildId]
+    );
+  }
+  if (channels.intl !== undefined) {
+    await pool.query(
+      `UPDATE tv_news_config SET channel_id_intl = $1 WHERE guild_id = $2`,
+      [channels.intl, guildId]
+    );
+  }
+  if (channels.kr !== undefined) {
+    await pool.query(
+      `UPDATE tv_news_config SET channel_id_kr = $1 WHERE guild_id = $2`,
+      [channels.kr, guildId]
+    );
+  }
 }
 
 export async function stopTVNews(guildId: string): Promise<boolean> {
@@ -182,12 +212,26 @@ export async function stopTVNews(guildId: string): Promise<boolean> {
   return (rowCount ?? 0) > 0;
 }
 
-export async function getTVNewsConfig(guildId: string): Promise<{ channelId: string; enabled: boolean } | null> {
+export interface TVNewsConfig {
+  channelIdAnime: string | null;
+  channelIdIntl:  string | null;
+  channelIdKr:    string | null;
+  enabled:        boolean;
+}
+
+export async function getTVNewsConfig(guildId: string): Promise<TVNewsConfig | null> {
   const { rows } = await pool.query(
-    `SELECT channel_id, enabled FROM tv_news_config WHERE guild_id = $1`,
+    `SELECT channel_id_anime, channel_id_intl, channel_id_kr, enabled
+     FROM tv_news_config WHERE guild_id = $1`,
     [guildId]
   );
-  return rows[0] ? { channelId: rows[0].channel_id, enabled: rows[0].enabled } : null;
+  if (!rows[0]) return null;
+  return {
+    channelIdAnime: rows[0].channel_id_anime ?? null,
+    channelIdIntl:  rows[0].channel_id_intl  ?? null,
+    channelIdKr:    rows[0].channel_id_kr    ?? null,
+    enabled:        rows[0].enabled,
+  };
 }
 
 // ─── Fetch & parse one source ─────────────────────────────────────────────────
@@ -274,7 +318,7 @@ function buildEmbed(item: TVItem): { embed: EmbedBuilder; row: ActionRowBuilder<
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
-      .setLabel("اقرأ المزيد / Read More")
+      .setLabel("Read More")
       .setStyle(ButtonStyle.Link)
       .setURL(item.link)
       .setEmoji("🔗")
@@ -283,31 +327,48 @@ function buildEmbed(item: TVItem): { embed: EmbedBuilder; row: ActionRowBuilder<
   return { embed, row };
 }
 
-// ─── Post to all guilds ───────────────────────────────────────────────────────
+// ─── Post to guilds — route each item to its category channel ─────────────────
 async function postToGuilds(client: Client, items: TVItem[]): Promise<void> {
   if (!items.length) return;
 
   const { rows: configs } = await pool.query(
-    `SELECT guild_id, channel_id FROM tv_news_config WHERE enabled = TRUE`
+    `SELECT guild_id, channel_id_anime, channel_id_intl, channel_id_kr
+     FROM tv_news_config WHERE enabled = TRUE`
   );
   if (!configs.length) return;
 
   for (const cfg of configs) {
-    try {
-      const ch = await client.channels.fetch(cfg.channel_id).catch(() => null) as TextChannel | null;
-      if (!ch?.isTextBased()) continue;
+    const channelMap = new Map<string, TVItem[]>();
 
-      for (const item of items) {
-        try {
-          const { embed, row } = buildEmbed(item);
-          await ch.send({ embeds: [embed], components: [row] });
-          await new Promise(r => setTimeout(r, 700));
-        } catch (err: any) {
-          console.warn(`[TVNews] Post failed: ${err.message}`);
+    for (const item of items) {
+      const channelId =
+        item.source.lang === "anime" ? cfg.channel_id_anime :
+        item.source.lang === "intl"  ? cfg.channel_id_intl  :
+        item.source.lang === "kr"    ? cfg.channel_id_kr    : null;
+
+      if (!channelId) continue;
+
+      if (!channelMap.has(channelId)) channelMap.set(channelId, []);
+      channelMap.get(channelId)!.push(item);
+    }
+
+    for (const [channelId, chItems] of channelMap.entries()) {
+      try {
+        const ch = await client.channels.fetch(channelId).catch(() => null) as TextChannel | null;
+        if (!ch?.isTextBased()) continue;
+
+        for (const item of chItems) {
+          try {
+            const { embed, row } = buildEmbed(item);
+            await ch.send({ embeds: [embed], components: [row] });
+            await new Promise(r => setTimeout(r, 700));
+          } catch (err: any) {
+            console.warn(`[TVNews] Post failed: ${err.message}`);
+          }
         }
+      } catch (err: any) {
+        console.warn(`[TVNews] Channel fetch failed: ${err.message}`);
       }
-    } catch (err: any) {
-      console.warn(`[TVNews] Channel fetch failed: ${err.message}`);
     }
   }
 }
@@ -321,7 +382,9 @@ async function runPollCycle(client: Client): Promise<void> {
 
   try {
     const { rows: active } = await pool.query(
-      `SELECT 1 FROM tv_news_config WHERE enabled = TRUE LIMIT 1`
+      `SELECT 1 FROM tv_news_config WHERE enabled = TRUE
+       AND (channel_id_anime IS NOT NULL OR channel_id_intl IS NOT NULL OR channel_id_kr IS NOT NULL)
+       LIMIT 1`
     );
     if (!active.length) return;
 
@@ -340,7 +403,6 @@ async function runPollCycle(client: Client): Promise<void> {
 
     await markSeen(fresh);
 
-    // Sort oldest → newest
     fresh.sort((a, b) => (a.pubDate?.getTime() ?? 0) - (b.pubDate?.getTime() ?? 0));
 
     console.log(`[TVNews] ${fresh.length} new item(s) to post`);
@@ -355,11 +417,11 @@ async function runPollCycle(client: Client): Promise<void> {
 export function registerTVNewsMonitor(client: Client): void {
   initTVNewsMonitor()
     .then(() => {
-      console.log("[TVNews] Initialized — polling every 15 min");
+      console.log("[TVNews] Initialized — polling every 5 min");
 
       setTimeout(() => {
         runPollCycle(client).catch(e => console.error("[TVNews] Initial poll error:", e));
-      }, 45_000); // 45s after startup (stagger from news-monitor's 30s)
+      }, 45_000);
 
       setInterval(() => {
         runPollCycle(client).catch(e => console.error("[TVNews] Poll error:", e));
