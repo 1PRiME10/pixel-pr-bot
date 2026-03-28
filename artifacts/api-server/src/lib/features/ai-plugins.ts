@@ -123,7 +123,7 @@ export const aiPluginCommands: AIPlugin[] = [
           .setDescription("Set the channel where breaking news will be posted.")
           .addChannelOption(o =>
             o.setName("channel")
-             .setDescription("Text channel to receive news alerts")
+             .setDescription("Text channel to receive breaking news")
              .setRequired(true)
           )
       )
@@ -133,7 +133,7 @@ export const aiPluginCommands: AIPlugin[] = [
       )
       .addSubcommand(sub =>
         sub.setName("status")
-          .setDescription("Show current news alerts configuration and sources.")
+          .setDescription("Show current configuration and list of news sources.")
       )
       .toJSON(),
 
@@ -255,23 +255,23 @@ export const aiPluginCommands: AIPlugin[] = [
     guildId: null,
     definition: new SlashCommandBuilder()
       .setName("tv-news")
-      .setDescription("أخبار الأنمي والأفلام والمسلسلات الأجنبية والكورية (مصادر رسمية)")
+      .setDescription("Anime, international film/TV & Korean drama news from official RSS sources.")
       .addSubcommand(sub =>
         sub.setName("set")
-          .setDescription("حدد القناة التي ستصلها أخبار الترفيه والأنمي")
+          .setDescription("Set the channel where entertainment news will be posted.")
           .addChannelOption(o =>
             o.setName("channel")
-             .setDescription("القناة النصية لاستقبال الأخبار")
+             .setDescription("Text channel to receive TV & anime news")
              .setRequired(true)
           )
       )
       .addSubcommand(sub =>
         sub.setName("stop")
-          .setDescription("إيقاف أخبار الترفيه في هذا السيرفر")
+          .setDescription("Stop posting entertainment news in this server.")
       )
       .addSubcommand(sub =>
         sub.setName("status")
-          .setDescription("عرض حالة الإعداد وقائمة المصادر")
+          .setDescription("Show current configuration and list of sources.")
       )
       .toJSON(),
 
