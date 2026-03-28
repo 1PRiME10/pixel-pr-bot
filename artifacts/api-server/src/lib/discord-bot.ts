@@ -42,6 +42,7 @@ import { registerSteganography } from "./features/steganography.js";
 import { initTracker, registerTracker, handleTrackerMessage } from "./features/tracker.js";
 import { registerEvents } from "./features/events.js";
 import { registerYouTubeMonitor } from "./features/youtube-monitor.js";
+import { registerNewsMonitor }   from "./features/news-monitor.js";
 import { initPersona, registerPersona, getPersonaInjection } from "./features/persona.js";
 import { initJPTracker, registerJPTracker } from "./features/jp-tracker.js";
 import { registerSlashCommands } from "./features/slash-commands.js";
@@ -906,6 +907,7 @@ async function connect(token: string): Promise<void> {
   registerJPTracker(client, PREFIX);
   registerEvents(client).catch(e => console.error("[Events] Init error:", e));
   registerYouTubeMonitor(client).catch(e => console.error("[YouTube] Init error:", e));
+  registerNewsMonitor(client);
   registerSlashCommands(client, token);
 
   // ─── Main message handler ────────────────────────────────────────────────────
