@@ -43,6 +43,7 @@ import { initTracker, registerTracker, handleTrackerMessage } from "./features/t
 import { registerEvents } from "./features/events.js";
 import { registerYouTubeMonitor } from "./features/youtube-monitor.js";
 import { registerNewsMonitor }   from "./features/news-monitor.js";
+import { registerTVNewsMonitor } from "./features/tv-news-monitor.js";
 import { initPersona, registerPersona, getPersonaInjection } from "./features/persona.js";
 import { initJPTracker, registerJPTracker } from "./features/jp-tracker.js";
 import { registerSlashCommands } from "./features/slash-commands.js";
@@ -908,6 +909,7 @@ async function connect(token: string): Promise<void> {
   registerEvents(client).catch(e => console.error("[Events] Init error:", e));
   registerYouTubeMonitor(client).catch(e => console.error("[YouTube] Init error:", e));
   registerNewsMonitor(client);
+  registerTVNewsMonitor(client);
   registerSlashCommands(client, token);
 
   // ─── Main message handler ────────────────────────────────────────────────────
