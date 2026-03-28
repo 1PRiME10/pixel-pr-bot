@@ -822,8 +822,12 @@ async function storeCmdHash(hash: string): Promise<void> {
 }
 
 function buildCmdHash(allCommands: unknown[]): string {
-  const names = (allCommands as { name: string }[]).map(c => c.name).sort().join(",");
-  return createHash("sha1").update(`${allCommands.length}:${names}`).digest("hex").slice(0, 12);
+  const stable = JSON.stringify(
+    (allCommands as { name: string }[])
+      .map(c => c)
+      .sort((a, b) => (a.name > b.name ? 1 : -1))
+  );
+  return createHash("sha1").update(stable).digest("hex").slice(0, 12);
 }
 
 // ─── Register slash commands via REST ─────────────────────────────────────────
