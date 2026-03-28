@@ -705,12 +705,19 @@ export async function fetchLatestTweets(
 ): Promise<{ tweets: Tweet[]; source: string }> {
 
   // ── 1. Syndication (stable, always chronological, works from Render IPs) ───
+  //
+  // NOTE: Syndication can serve stale/pinned timelines for some accounts — it may
+  // return tweets that are months or years old even when the account has posted today.
+  // So we ONLY trust Syndication when it returns new tweets (filtered.length > 0).
+  // When it returns 0 new, we ALWAYS fall through to Proxy for verification.
+  // This prevents missed tweets caused by stale Syndication caches.
+  let syndicationEmpty = false;
   try {
     const result = await fetchViaSyndication(username, sinceId);
-    // Accept if we got tweets. For sinceId mode: "0 new" is valid (means nothing new).
-    // For no-sinceId mode: only skip if literally 0 tweets total (account has no public posts).
-    if (sinceId != null || result.tweets.length > 0) return result;
-    console.warn(`[TweetMonitor] @${username} — Syndication returned 0 tweets (new account?), trying proxy`);
+    if (result.tweets.length > 0) return result; // ← new tweets found, done
+    // 0 new tweets from Syndication — could be stale cache, fall through to Proxy
+    syndicationEmpty = true;
+    console.warn(`[TweetMonitor] @${username} — Syndication returned 0 new tweets, verifying with proxy`);
   } catch (err: any) {
     console.warn(`[TweetMonitor] @${username} — Syndication failed (${err.message}), trying proxy`);
   }
@@ -720,6 +727,8 @@ export async function fetchLatestTweets(
     try {
       const proxyResult = await fetchViaProxy(username, sinceId);
       if (proxyResult.tweets.length > 0) return proxyResult;
+      // Both Syndication and Proxy agree: no new tweets → trust the result
+      if (sinceId != null && syndicationEmpty) return proxyResult;
       console.warn(`[TweetMonitor] @${username} — Proxy returned 0 tweets, trying direct GraphQL`);
     } catch (err: any) {
       console.warn(`[TweetMonitor] @${username} — Proxy failed (${err.message}), trying direct GraphQL`);
