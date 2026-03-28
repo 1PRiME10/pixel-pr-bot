@@ -141,7 +141,7 @@ export const aiPluginCommands: AIPlugin[] = [
       try {
         if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels)) {
           await interaction.reply({
-            content: "❌ تحتاج صلاحية **Manage Channels** لاستخدام هذا الأمر.",
+            content: "❌ You need **Manage Channels** permission to use this command.",
             flags: MessageFlags.Ephemeral,
           });
           return;
@@ -161,7 +161,7 @@ export const aiPluginCommands: AIPlugin[] = [
           const channel = interaction.options.getChannel("channel", true) as any;
 
           if (!channel.isTextBased() || channel.isVoiceBased()) {
-            await interaction.editReply({ content: `❌ <#${channel.id}> ليست قناة نصية.` });
+            await interaction.editReply({ content: `❌ <#${channel.id}> is not a text channel.` });
             return;
           }
 
@@ -173,26 +173,26 @@ export const aiPluginCommands: AIPlugin[] = [
 
           const embed = new EmbedBuilder()
             .setColor(Colors.Green)
-            .setTitle("📰 تم تفعيل الأخبار العاجلة")
-            .setDescription(`سيتم نشر الأخبار في <#${channel.id}> كل **15 دقيقة** تلقائياً.`)
+            .setTitle("📰 News Alerts Activated")
+            .setDescription(`Breaking news will be posted in <#${channel.id}> every **5 minutes** automatically.`)
             .addFields(
               {
-                name: "🌍 المصادر العربية",
+                name: "🌍 Arabic Sources",
                 value: arabicSources.map(s => `${s.flag} ${s.name}`).join("\n"),
                 inline: true,
               },
               {
-                name: "🌐 المصادر الدولية",
+                name: "🌐 International Sources",
                 value: intlSources.map(s => `${s.flag} ${s.name}`).join("\n"),
                 inline: true,
               },
               {
-                name: "🇯🇵 المصادر اليابانية",
+                name: "🇯🇵 Japanese Sources",
                 value: japaneseSources.map(s => `${s.flag} ${s.name}`).join("\n"),
                 inline: true,
               },
             )
-            .setFooter({ text: "أخبار مباشرة من المصادر الرسمية — بدون Twitter" });
+            .setFooter({ text: "Live news from official sources — no Twitter required" });
 
           await interaction.editReply({ embeds: [embed] });
 
@@ -201,9 +201,9 @@ export const aiPluginCommands: AIPlugin[] = [
           await interaction.deferReply({ flags: MessageFlags.Ephemeral });
           const stopped = await stopNewsAlerts(guildId);
           if (stopped) {
-            await interaction.editReply({ content: "✅ تم إيقاف تنبيهات الأخبار لهذا السيرفر." });
+            await interaction.editReply({ content: "✅ News alerts have been stopped for this server." });
           } else {
-            await interaction.editReply({ content: "⚠️ لم تكن تنبيهات الأخبار مفعّلة." });
+            await interaction.editReply({ content: "⚠️ News alerts were not active." });
           }
 
         // ── /news-alerts status ───────────────────────────────────────────────
@@ -213,32 +213,32 @@ export const aiPluginCommands: AIPlugin[] = [
 
           if (!config) {
             await interaction.editReply({
-              content: "📭 لم يتم إعداد تنبيهات الأخبار بعد.\nاستخدم `/news-alerts set` لتفعيلها.",
+              content: "📭 News alerts are not configured yet.\nUse `/news-alerts set` to activate them.",
             });
             return;
           }
 
-          const statusEmoji = config.enabled ? "✅ مفعّل" : "⛔ موقوف";
+          const statusEmoji = config.enabled ? "✅ Active" : "⛔ Stopped";
           const embed = new EmbedBuilder()
             .setColor(config.enabled ? Colors.Green : Colors.Red)
-            .setTitle("📰 حالة تنبيهات الأخبار")
+            .setTitle("📰 News Alerts Status")
             .addFields(
-              { name: "الحالة",   value: statusEmoji,            inline: true },
-              { name: "القناة",   value: `<#${config.channelId}>`, inline: true },
-              { name: "عدد المصادر", value: `${NEWS_SOURCES.length} مصدر رسمي`, inline: true },
+              { name: "Status",  value: statusEmoji,                           inline: true },
+              { name: "Channel", value: `<#${config.channelId}>`,              inline: true },
+              { name: "Sources", value: `${NEWS_SOURCES.length} official`,     inline: true },
               {
-                name: "المصادر",
+                name: "All Sources",
                 value: NEWS_SOURCES.map(s => `${s.flag} ${s.name}`).join(" • "),
               },
             )
-            .setFooter({ text: "يتحقق كل 15 دقيقة — أخبار عاجلة مباشرة من المواقع الرسمية" });
+            .setFooter({ text: "Checks every 5 minutes — breaking news from official websites" });
 
           await interaction.editReply({ embeds: [embed] });
         }
 
       } catch (error) {
         console.error("[/news-alerts] Error:", error);
-        const msg = { content: "حدث خطأ، يرجى المحاولة مجدداً." };
+        const msg = { content: "An error occurred, please try again." };
         if (interaction.replied || interaction.deferred) {
           await interaction.editReply(msg).catch(() => {});
         } else {
@@ -279,7 +279,7 @@ export const aiPluginCommands: AIPlugin[] = [
       try {
         if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels)) {
           await interaction.reply({
-            content: "❌ تحتاج صلاحية **Manage Channels** لاستخدام هذا الأمر.",
+            content: "❌ You need **Manage Channels** permission to use this command.",
             flags: MessageFlags.Ephemeral,
           });
           return;
@@ -299,7 +299,7 @@ export const aiPluginCommands: AIPlugin[] = [
           const channel = interaction.options.getChannel("channel", true) as any;
 
           if (!channel.isTextBased() || channel.isVoiceBased()) {
-            await interaction.editReply({ content: `❌ <#${channel.id}> ليست قناة نصية.` });
+            await interaction.editReply({ content: `❌ <#${channel.id}> is not a text channel.` });
             return;
           }
 
@@ -311,26 +311,26 @@ export const aiPluginCommands: AIPlugin[] = [
 
           const embed = new EmbedBuilder()
             .setColor(0xE91E8C)
-            .setTitle("📺 تم تفعيل أخبار الترفيه")
-            .setDescription(`سيتم نشر أخبار الأنمي والأفلام والدراما في <#${channel.id}> كل **15 دقيقة**.`)
+            .setTitle("📺 TV & Anime News Activated")
+            .setDescription(`Anime, film & Korean drama news will be posted in <#${channel.id}> every **5 minutes**.`)
             .addFields(
               {
-                name: "🎌 أنمي / ياباني",
+                name: "🎌 Anime / Japanese",
                 value: animeSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
                 inline: true,
               },
               {
-                name: "🎬 أفلام ومسلسلات",
+                name: "🎬 Film & TV",
                 value: intlSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
                 inline: true,
               },
               {
-                name: "🇰🇷 كوري",
+                name: "🇰🇷 Korean",
                 value: krSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
                 inline: true,
               },
             )
-            .setFooter({ text: `${TV_SOURCES.length} مصدر رسمي — مواسم جديدة، إصدارات، أخبار عاجلة` });
+            .setFooter({ text: `${TV_SOURCES.length} official sources — new seasons, releases & breaking news` });
 
           await interaction.editReply({ embeds: [embed] });
 
@@ -340,8 +340,8 @@ export const aiPluginCommands: AIPlugin[] = [
           const stopped = await stopTVNews(guildId);
           await interaction.editReply({
             content: stopped
-              ? "✅ تم إيقاف أخبار الترفيه."
-              : "⚠️ لم تكن أخبار الترفيه مفعّلة.",
+              ? "✅ TV & anime news have been stopped."
+              : "⚠️ TV & anime news were not active.",
           });
 
         // ── /tv-news status ───────────────────────────────────────────────────
@@ -351,40 +351,40 @@ export const aiPluginCommands: AIPlugin[] = [
 
           if (!config) {
             await interaction.editReply({
-              content: "📭 لم يتم إعداد أخبار الترفيه بعد.\nاستخدم `/tv-news set` لتفعيلها.",
+              content: "📭 TV news is not configured yet.\nUse `/tv-news set` to activate it.",
             });
             return;
           }
 
-          const statusEmoji = config.enabled ? "✅ مفعّل" : "⛔ موقوف";
+          const statusEmoji = config.enabled ? "✅ Active" : "⛔ Stopped";
           const embed = new EmbedBuilder()
             .setColor(config.enabled ? Colors.Green : Colors.Red)
-            .setTitle("📺 حالة أخبار الترفيه")
+            .setTitle("📺 TV & Anime News Status")
             .addFields(
-              { name: "الحالة",      value: statusEmoji,               inline: true },
-              { name: "القناة",      value: `<#${config.channelId}>`,   inline: true },
-              { name: "المصادر",     value: `${TV_SOURCES.length} مصدر رسمي`, inline: true },
+              { name: "Status",  value: statusEmoji,                         inline: true },
+              { name: "Channel", value: `<#${config.channelId}>`,            inline: true },
+              { name: "Sources", value: `${TV_SOURCES.length} official`,     inline: true },
               {
-                name: "🎌 أنمي",
+                name: "🎌 Anime",
                 value: TV_SOURCES.filter(s => s.lang === "anime").map(s => `${s.flag} ${s.name}`).join(" • "),
               },
               {
-                name: "🎬 أفلام & مسلسلات",
+                name: "🎬 Film & TV",
                 value: TV_SOURCES.filter(s => s.lang === "intl").map(s => `${s.flag} ${s.name}`).join(" • "),
               },
               {
-                name: "🇰🇷 كوري",
+                name: "🇰🇷 Korean",
                 value: TV_SOURCES.filter(s => s.lang === "kr").map(s => `${s.flag} ${s.name}`).join(" • "),
               },
             )
-            .setFooter({ text: "يتحقق كل 15 دقيقة من RSS الرسمية" });
+            .setFooter({ text: "Checks every 5 minutes from official RSS feeds" });
 
           await interaction.editReply({ embeds: [embed] });
         }
 
       } catch (error) {
         console.error("[/tv-news] Error:", error);
-        const msg = { content: "حدث خطأ، يرجى المحاولة مجدداً." };
+        const msg = { content: "An error occurred, please try again." };
         if (interaction.replied || interaction.deferred) {
           await interaction.editReply(msg).catch(() => {});
         } else {
