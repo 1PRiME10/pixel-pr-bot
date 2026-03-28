@@ -934,7 +934,8 @@ async function pollAccount(
   // rather than being silently skipped forever.
   let lastSuccessfullySentId: string | null = null;
 
-  for (const tweet of newTweets) {
+  for (let ti = 0; ti < newTweets.length; ti++) {
+    const tweet = newTweets[ti];
     try {
       await channel.send({
         embeds: [buildTweetEmbed(tweet, username)],
@@ -943,6 +944,10 @@ async function pollAccount(
       lastSuccessfullySentId = tweet.id;
     } catch (e: any) {
       console.warn(`[TweetMonitor] @${username} — failed to send tweet ${tweet.id}: ${e?.message ?? e}`);
+    }
+    // 1.5 s stagger between tweets — reduces event-loop pressure during burst sends
+    if (ti < newTweets.length - 1) {
+      await new Promise<void>(resolve => setTimeout(resolve, 1_500));
     }
   }
 
@@ -1055,7 +1060,8 @@ async function runPollCycle(client: Client): Promise<void> {
     }
 
     // ── Phase 2: distribute cached results to every (guild, username) row ──────
-    for (const row of rows) {
+    for (let ri = 0; ri < rows.length; ri++) {
+      const row = rows[ri];
       try {
         const result = await pollAccount(
           client,
@@ -1076,6 +1082,10 @@ async function runPollCycle(client: Client): Promise<void> {
         }
       } catch (rowErr) {
         console.error(`[TweetMonitor] Error polling @${row.twitter_user}:`, rowErr);
+      }
+      // 1.5 s between accounts to avoid burst Discord sends during peak cycles
+      if (ri < rows.length - 1) {
+        await new Promise<void>(resolve => setTimeout(resolve, 1_500));
       }
     }
   } finally {
