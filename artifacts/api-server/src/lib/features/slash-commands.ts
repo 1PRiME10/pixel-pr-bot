@@ -1284,6 +1284,8 @@ function handleInteractions(client: Client): void {
             { name: "📢 Utilities", value: "`/say` `/role` `/daily` `/feature`\n> 🌐 **Translation:** React to any message with a flag emoji (🇸🇦 🇺🇸 🇯🇵…) to auto-translate it!", inline: false },
             { name: "📺 YouTube Monitor", value: "`/addyoutube` `/removeyoutube` `/youtubelist`", inline: false },
             { name: "🐦 Twitter/X Monitor", value: "`/addtwitter` `/removetwitter` `/twitterlist`", inline: false },
+            { name: "📰 أخبار عاجلة — News Alerts", value: "`/news-alerts set` — حدد قناة الأخبار العاجلة (عربي + دولي + ياباني)\n`/news-alerts stop` — أوقف الأخبار\n`/news-alerts status` — الحالة والمصادر", inline: false },
+            { name: "🎬 أخبار ترفيهية — TV & Anime News", value: "`/tv-news set` — حدد قناة أخبار الأنمي والأفلام والدراما الكورية\n`/tv-news stop` — أوقف الأخبار\n`/tv-news status` — الحالة والمصادر", inline: false },
             { name: "⚙️ Admin — AI & Server", value: "`/clearchat` `/setserverlog` `/removeserverlog` `/setwelcome` `/setwelcomemsg` `/removewelcome` `/testwelcome`", inline: false },
             { name: "🔧 Utility", value: "`/ping` `/avatar` `/serverinfo` `/userinfo` `/help`", inline: false },
           )
