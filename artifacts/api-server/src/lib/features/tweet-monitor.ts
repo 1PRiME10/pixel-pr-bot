@@ -1121,6 +1121,67 @@ export async function resetAllTwitterAccounts(guildId: string): Promise<number> 
   return res.rowCount ?? 0;
 }
 
+/**
+ * Advance every account's last_tweet_id to its ACTUAL current latest tweet,
+ * without posting anything to Discord. Call this after fixing the proxy so that
+ * old stale IDs don't cause a flood of historical tweets on the next poll.
+ */
+export async function advanceAllTwitterAccounts(
+  guildId: string,
+): Promise<{ updated: string[]; skipped: string[]; failed: string[] }> {
+  const rows = await pool.query(
+    `SELECT twitter_user, twitter_user_id FROM tweet_monitors WHERE guild_id = $1 AND unreachable = FALSE`,
+    [guildId],
+  ).then(r => r.rows as { twitter_user: string; twitter_user_id: string | null }[]);
+
+  const updated: string[] = [];
+  const skipped: string[] = [];
+  const failed:  string[] = [];
+
+  for (const row of rows) {
+    const username = row.twitter_user;
+    try {
+      // Fetch latest tweets WITHOUT sinceId — get whatever is newest right now
+      const { tweets } = await fetchViaProxy(username, null);
+
+      // Also try the full fetch chain as fallback
+      let candidates = tweets;
+      if (!candidates.length) {
+        try {
+          const chain = await fetchTweets(username);
+          candidates = chain;
+        } catch { /* ignore */ }
+      }
+
+      // Only keep numeric IDs (Twitter snowflakes)
+      const validTweets = candidates.filter(t => /^\d+$/.test(t.id));
+      if (!validTweets.length) { skipped.push(username); continue; }
+
+      // Pick the highest (newest) ID
+      const newestId = validTweets.reduce((best, t) =>
+        BigInt(t.id) > BigInt(best.id) ? t : best,
+      ).id;
+
+      await pool.query(
+        `UPDATE tweet_monitors
+         SET last_tweet_id = $1,
+             fail_count    = 0,
+             last_fail_at  = NULL,
+             unreachable   = FALSE,
+             last_error    = NULL
+         WHERE guild_id = $2 AND twitter_user = $3`,
+        [newestId, guildId, username],
+      );
+      updated.push(username);
+    } catch (err: any) {
+      console.error(`[TweetMonitor] advanceAll: failed for @${username}:`, err?.message ?? err);
+      failed.push(username);
+    }
+  }
+
+  return { updated, skipped, failed };
+}
+
 export { FAILURE_THRESHOLD };
 
 async function handleAddTwitter(message: Message, args: string[]): Promise<void> {
