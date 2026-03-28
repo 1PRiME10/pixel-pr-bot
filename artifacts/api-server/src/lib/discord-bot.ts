@@ -1556,7 +1556,7 @@ function startKeepAlive(): void {
   // Never use /api/healthz here (it runs a DB query on every ping).
   // Render free tier spins down after 15 min of inactivity — ping every 10 min is safe.
   const pingUrl = `${base}/health`;
-  console.log(`[KeepAlive] Pinging ${pingUrl} every 10 min to prevent Render free-tier sleep`);
+  console.log(`[KeepAlive] Pinging ${pingUrl} every 10s to prevent Render free-tier sleep`);
 
   const doPing = async () => {
     try {
@@ -1567,8 +1567,8 @@ function startKeepAlive(): void {
     }
   };
 
-  doPing();                           // fire immediately on cold start
-  setInterval(doPing, 10 * 60_000);  // then every 10 minutes
+  doPing();                      // fire immediately on cold start
+  setInterval(doPing, 10_000);   // then every 10 seconds
 }
 
 async function ensureLeaderTable(): Promise<void> {
