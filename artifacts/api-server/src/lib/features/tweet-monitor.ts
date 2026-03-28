@@ -1438,6 +1438,26 @@ async function handleTwitterReset(message: Message): Promise<void> {
 // each holding a stale client reference after repeated reconnects.
 let _tweetPollIntervalRef: ReturnType<typeof setInterval> | null = null;
 
+// ─── Auto-reset failing accounts every 10 minutes ────────────────────────────
+// After FAILURE_THRESHOLD consecutive failures the bot switches to slow-retry
+// (6 h). The auto-reset clears that state so the normal 5-min cycle resumes
+// automatically — no manual /twitterreset needed.
+async function autoResetFailingAccounts(): Promise<void> {
+  try {
+    const { rowCount } = await pool.query(`
+      UPDATE tweet_monitors
+         SET fail_count = 0, last_fail_at = NULL
+       WHERE unreachable = FALSE
+         AND fail_count  >= $1
+    `, [FAILURE_THRESHOLD]);
+    if (rowCount && rowCount > 0) {
+      console.log(`[TweetMonitor] ♻️ Auto-reset ${rowCount} failing account(s) — will retry on next poll`);
+    }
+  } catch (e: any) {
+    console.warn("[TweetMonitor] Auto-reset error:", e?.message ?? e);
+  }
+}
+
 export function registerTweetMonitor(client: Client): void {
   // Clear interval from previous connect() call (interval leak fix)
   if (_tweetPollIntervalRef) {
@@ -1449,6 +1469,10 @@ export function registerTweetMonitor(client: Client): void {
     () => runPollCycle(client).catch(e => console.error("[TweetMonitor] Poll cycle crashed:", e)),
     POLL_INTERVAL_MS,
   );
+
+  // Auto-reset failing accounts every 10 minutes (clears slow-retry state)
+  setInterval(() => autoResetFailingAccounts(), 10 * 60 * 1000);
+
   // First poll 30 s after startup (gives Discord connection time to stabilise)
   setTimeout(
     () => runPollCycle(client).catch(e => console.error("[TweetMonitor] Initial poll crashed:", e)),
