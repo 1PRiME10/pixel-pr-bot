@@ -44,7 +44,7 @@ import {
 import { clearMemory } from "./memory.js";
 import { getWarnings, addWarningAndCheck, clearWarnings } from "./moderation.js";
 import { pickEmoji, parseEmotion, getExpressionImagePath } from "./ai-hoshino-emojis.js";
-import { addTwitterAccount, removeTwitterAccount, listTwitterAccounts, resetAllTwitterAccounts, cleanUsername, FAILURE_THRESHOLD } from "./tweet-monitor.js";
+import { addTwitterAccount, removeTwitterAccount, listTwitterAccounts, resetAllTwitterAccounts, advanceAllTwitterAccounts, cleanUsername, FAILURE_THRESHOLD } from "./tweet-monitor.js";
 import {
   addYouTubeChannel, removeYouTubeChannel, listYouTubeChannels,
   resolveYTChannelId, findYTChannelByName, fetchLatestVideos as fetchYTVideos,
@@ -735,6 +735,12 @@ const commands = [
   new SlashCommandBuilder()
     .setName("twitterreset")
     .setDescription("Reset all failing Twitter/X accounts and force them to retry immediately (Admin only)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  // ── Twitter advance — sync last_tweet_id to actual latest (Admin only) ────
+  new SlashCommandBuilder()
+    .setName("twitteradvance")
+    .setDescription("Sync all accounts to their actual latest tweet — prevents old-tweet floods after proxy fixes (Admin only)")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   // ── Joke auto-scheduler (Admin only) ──────────────────────────────────────
@@ -2157,6 +2163,25 @@ function handleInteractions(client: Client): void {
             `Use \`/twitterlist\` to check their status after the next poll.`,
           );
         }
+        return;
+      }
+
+      // ── /twitteradvance ────────────────────────────────────────────────────
+      if (commandName === "twitteradvance") {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const gid = interaction.guildId!;
+        await interaction.editReply("⏳ Syncing all accounts to their actual latest tweet… (may take 30–60 s)");
+
+        const { updated, skipped, failed } = await advanceAllTwitterAccounts(gid);
+
+        const lines: string[] = [];
+        if (updated.length) lines.push(`✅ **Synced (${updated.length}):** ${updated.map(u => `@${u}`).join(", ")}`);
+        if (skipped.length) lines.push(`🟡 **No tweets found (${skipped.length}):** ${skipped.map(u => `@${u}`).join(", ")}`);
+        if (failed.length)  lines.push(`❌ **Failed (${failed.length}):** ${failed.map(u => `@${u}`).join(", ")}`);
+        lines.push(`\nFrom now on only **new** tweets will be posted — no old-tweet flood.`);
+        lines.push(`Use \`/twitterlist\` to verify.`);
+
+        await interaction.editReply(lines.join("\n"));
         return;
       }
 
