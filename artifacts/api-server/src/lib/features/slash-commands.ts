@@ -1288,8 +1288,8 @@ function handleInteractions(client: Client): void {
             { name: "📢 Utilities", value: "`/say` `/role` `/daily` `/feature`\n> 🌐 **Translation:** React to any message with a flag emoji (🇸🇦 🇺🇸 🇯🇵…) to auto-translate it!", inline: false },
             { name: "📺 YouTube Monitor", value: "`/addyoutube` `/removeyoutube` `/youtubelist`", inline: false },
             { name: "🐦 Twitter/X Monitor", value: "`/addtwitter` `/removetwitter` `/twitterlist`", inline: false },
-            { name: "📰 News Alerts", value: "`/news-alerts set` — Set the channel for breaking news (Arabic + International + Japanese)\n`/news-alerts stop` — Stop news alerts\n`/news-alerts status` — Show status and sources", inline: false },
-            { name: "🎬 TV & Anime News", value: "`/tv-news set` — Set the channel for anime, film & Korean drama news\n`/tv-news stop` — Stop TV news\n`/tv-news status` — Show status and sources", inline: false },
+            { name: "📰 News Alerts", value: "`/news-alerts set [arabic-channel] [international-channel] [japanese-channel]` — Set a separate channel per region (all optional, provide at least one)\n`/news-alerts stop` — Stop all news alerts\n`/news-alerts status` — Show configured channels and status", inline: false },
+            { name: "🎬 TV & Anime News", value: "`/tv-news set [anime-channel] [film-channel] [korean-channel]` — Set a separate channel per category (all optional, provide at least one)\n`/tv-news stop` — Stop all TV news\n`/tv-news status` — Show configured channels and status", inline: false },
             { name: "⚙️ Admin — AI & Server", value: "`/clearchat` `/setserverlog` `/removeserverlog` `/setwelcome` `/setwelcomemsg` `/removewelcome` `/testwelcome`", inline: false },
             { name: "🔧 Utility", value: "`/ping` `/avatar` `/serverinfo` `/userinfo` `/help`", inline: false },
           )
