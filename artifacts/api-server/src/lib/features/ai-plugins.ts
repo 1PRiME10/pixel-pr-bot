@@ -16,6 +16,7 @@ import {
 import { generateWithFallback } from "@workspace/integrations-gemini-ai";
 import { pool }  from "@workspace/db";
 import { NEWS_SOURCES, setNewsChannel, stopNewsAlerts, getNewsConfig } from "./news-monitor.js";
+import { TV_SOURCES, setTVNewsChannel, stopTVNews, getTVNewsConfig } from "./tv-news-monitor.js";
 
 export interface AIPlugin {
   name:       string;
@@ -237,6 +238,152 @@ export const aiPluginCommands: AIPlugin[] = [
 
       } catch (error) {
         console.error("[/news-alerts] Error:", error);
+        const msg = { content: "حدث خطأ، يرجى المحاولة مجدداً." };
+        if (interaction.replied || interaction.deferred) {
+          await interaction.editReply(msg).catch(() => {});
+        } else {
+          await interaction.reply({ ...msg, flags: MessageFlags.Ephemeral }).catch(() => {});
+        }
+      }
+    },
+  },
+  // ─── /tv-news ──────────────────────────────────────────────────────────────
+  // Entertainment news: Anime, International Film/TV, Korean Drama/Pop.
+  // Official RSS sources — no API key, updates every 15 minutes.
+  {
+    name: "tv-news",
+    guildId: null,
+    definition: new SlashCommandBuilder()
+      .setName("tv-news")
+      .setDescription("أخبار الأنمي والأفلام والمسلسلات الأجنبية والكورية (مصادر رسمية)")
+      .addSubcommand(sub =>
+        sub.setName("set")
+          .setDescription("حدد القناة التي ستصلها أخبار الترفيه والأنمي")
+          .addChannelOption(o =>
+            o.setName("channel")
+             .setDescription("القناة النصية لاستقبال الأخبار")
+             .setRequired(true)
+          )
+      )
+      .addSubcommand(sub =>
+        sub.setName("stop")
+          .setDescription("إيقاف أخبار الترفيه في هذا السيرفر")
+      )
+      .addSubcommand(sub =>
+        sub.setName("status")
+          .setDescription("عرض حالة الإعداد وقائمة المصادر")
+      )
+      .toJSON(),
+
+    handler: async (interaction: ChatInputCommandInteraction): Promise<void> => {
+      try {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels)) {
+          await interaction.reply({
+            content: "❌ تحتاج صلاحية **Manage Channels** لاستخدام هذا الأمر.",
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const guildId = interaction.guildId;
+        if (!guildId) {
+          await interaction.reply({ content: "This command can only be used in a server.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        const sub = interaction.options.getSubcommand();
+
+        // ── /tv-news set ──────────────────────────────────────────────────────
+        if (sub === "set") {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const channel = interaction.options.getChannel("channel", true) as any;
+
+          if (!channel.isTextBased() || channel.isVoiceBased()) {
+            await interaction.editReply({ content: `❌ <#${channel.id}> ليست قناة نصية.` });
+            return;
+          }
+
+          await setTVNewsChannel(guildId, channel.id);
+
+          const animeSrcs = TV_SOURCES.filter(s => s.lang === "anime");
+          const intlSrcs  = TV_SOURCES.filter(s => s.lang === "intl");
+          const krSrcs    = TV_SOURCES.filter(s => s.lang === "kr");
+
+          const embed = new EmbedBuilder()
+            .setColor(0xE91E8C)
+            .setTitle("📺 تم تفعيل أخبار الترفيه")
+            .setDescription(`سيتم نشر أخبار الأنمي والأفلام والدراما في <#${channel.id}> كل **15 دقيقة**.`)
+            .addFields(
+              {
+                name: "🎌 أنمي / ياباني",
+                value: animeSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
+                inline: true,
+              },
+              {
+                name: "🎬 أفلام ومسلسلات",
+                value: intlSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
+                inline: true,
+              },
+              {
+                name: "🇰🇷 كوري",
+                value: krSrcs.map(s => `${s.flag} ${s.name}`).join("\n"),
+                inline: true,
+              },
+            )
+            .setFooter({ text: `${TV_SOURCES.length} مصدر رسمي — مواسم جديدة، إصدارات، أخبار عاجلة` });
+
+          await interaction.editReply({ embeds: [embed] });
+
+        // ── /tv-news stop ─────────────────────────────────────────────────────
+        } else if (sub === "stop") {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const stopped = await stopTVNews(guildId);
+          await interaction.editReply({
+            content: stopped
+              ? "✅ تم إيقاف أخبار الترفيه."
+              : "⚠️ لم تكن أخبار الترفيه مفعّلة.",
+          });
+
+        // ── /tv-news status ───────────────────────────────────────────────────
+        } else if (sub === "status") {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const config = await getTVNewsConfig(guildId);
+
+          if (!config) {
+            await interaction.editReply({
+              content: "📭 لم يتم إعداد أخبار الترفيه بعد.\nاستخدم `/tv-news set` لتفعيلها.",
+            });
+            return;
+          }
+
+          const statusEmoji = config.enabled ? "✅ مفعّل" : "⛔ موقوف";
+          const embed = new EmbedBuilder()
+            .setColor(config.enabled ? Colors.Green : Colors.Red)
+            .setTitle("📺 حالة أخبار الترفيه")
+            .addFields(
+              { name: "الحالة",      value: statusEmoji,               inline: true },
+              { name: "القناة",      value: `<#${config.channelId}>`,   inline: true },
+              { name: "المصادر",     value: `${TV_SOURCES.length} مصدر رسمي`, inline: true },
+              {
+                name: "🎌 أنمي",
+                value: TV_SOURCES.filter(s => s.lang === "anime").map(s => `${s.flag} ${s.name}`).join(" • "),
+              },
+              {
+                name: "🎬 أفلام & مسلسلات",
+                value: TV_SOURCES.filter(s => s.lang === "intl").map(s => `${s.flag} ${s.name}`).join(" • "),
+              },
+              {
+                name: "🇰🇷 كوري",
+                value: TV_SOURCES.filter(s => s.lang === "kr").map(s => `${s.flag} ${s.name}`).join(" • "),
+              },
+            )
+            .setFooter({ text: "يتحقق كل 15 دقيقة من RSS الرسمية" });
+
+          await interaction.editReply({ embeds: [embed] });
+        }
+
+      } catch (error) {
+        console.error("[/tv-news] Error:", error);
         const msg = { content: "حدث خطأ، يرجى المحاولة مجدداً." };
         if (interaction.replied || interaction.deferred) {
           await interaction.editReply(msg).catch(() => {});
