@@ -727,8 +727,36 @@ export async function fetchLatestTweets(
     try {
       const proxyResult = await fetchViaProxy(username, sinceId);
       if (proxyResult.tweets.length > 0) return proxyResult;
-      // Both Syndication and Proxy agree: no new tweets → trust the result
-      if (sinceId != null && syndicationEmpty) return proxyResult;
+
+      // Both Syndication and Proxy returned 0 — but Syndication may be serving a
+      // stale cache. Do a quick "fresh check" without sinceId to get the absolute
+      // latest tweet, then compare its ID to what we have stored.
+      // If the latest tweet is newer than sinceId, Syndication lied → recover the tweet.
+      if (sinceId != null && isNumericId(sinceId) && syndicationEmpty) {
+        try {
+          const freshCheck = await fetchViaProxy(username, null);
+          if (freshCheck.tweets.length > 0) {
+            // Sort newest-first to reliably get the latest tweet
+            const sorted = [...freshCheck.tweets].sort((a, b) => {
+              if (!isNumericId(a.id) || !isNumericId(b.id)) return 0;
+              return BigInt(b.id) > BigInt(a.id) ? 1 : -1;
+            });
+            const latestId = sorted[0]?.id;
+            if (latestId && isNumericId(latestId) && BigInt(latestId) > BigInt(sinceId)) {
+              // Stale-cache miss confirmed — there IS a newer tweet we almost skipped
+              console.warn(
+                `[TweetMonitor] @${username} — stale-cache miss: latest=${latestId}, tracked=${sinceId}. Recovering missed tweet(s).`
+              );
+              const missed = sorted.filter(t => isNumericId(t.id) && BigInt(t.id) > BigInt(sinceId));
+              return { tweets: missed, source: `${freshCheck.source}:stale-fix` };
+            }
+          }
+        } catch {
+          // Fresh check failed — fall through to GraphQL methods
+        }
+        return proxyResult; // Confirmed: genuinely no new tweets
+      }
+
       console.warn(`[TweetMonitor] @${username} — Proxy returned 0 tweets, trying direct GraphQL`);
     } catch (err: any) {
       console.warn(`[TweetMonitor] @${username} — Proxy failed (${err.message}), trying direct GraphQL`);
