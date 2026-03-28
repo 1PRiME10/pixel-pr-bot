@@ -1,6 +1,6 @@
 import app from "./app";
 import { logger } from "./lib/logger";
-import { getClient } from "./lib/discord-bot";
+import { getClient, clearOldConversations } from "./lib/discord-bot";
 import { pool } from "@workspace/db";
 
 // ─── Startup DB migrations (run unconditionally, bot does not need to be online) ─
@@ -52,6 +52,16 @@ const server = app.listen(port, (err) => {
   logger.info({ port }, "Server listening");
 });
 
+// ─── HTTP server hardening ─────────────────────────────────────────────────
+// keepAliveTimeout > proxy idle timeout prevents ECONNRESET under concurrent pings.
+// headersTimeout must be > keepAliveTimeout (Node.js requirement).
+// maxConnections caps file-descriptor usage under sustained load.
+server.keepAliveTimeout  = 65_000;  // 65s — above most proxy 60s idle timeouts
+server.headersTimeout    = 66_000;  // must exceed keepAliveTimeout
+(server as any).maxConnections = 200; // hard cap against connection exhaustion
+
+// Keep-alive is handled by discord-bot.ts → startKeepAlive() (pings every 10 min).
+
 // ─── DB Keep-alive ────────────────────────────────────────────────────────────
 // PostgreSQL drops idle connections after a period of inactivity (Render free
 // tier: ~5 min). A lightweight ping every 3 minutes keeps the pool alive with
@@ -63,6 +73,40 @@ setInterval(async () => {
     logger.warn({ e }, "[DB] Keep-alive ping failed — pool may reconnect automatically");
   }
 }, 3 * 60_000); // every 3 minutes (2-minute safety margin before 5-min idle limit)
+
+// ─── Memory watchdog ──────────────────────────────────────────────────────────
+// Render free tier: 512 MB RAM / 384 MB heap cap.
+// Checks every 60 s (was 2 min) — catches spikes twice as fast.
+// Four tiers:
+//   < 250 MB  → normal, just log
+//   ≥ 250 MB  → pre-emptive: evict conversations idle > 15 min
+//   ≥ 300 MB  → warning:     evict conversations idle >  5 min
+//   ≥ 350 MB  → critical:    evict conversations idle >  2 min + force GC
+setInterval(() => {
+  const mem  = process.memoryUsage();
+  const heap = Math.round(mem.heapUsed  / 1024 / 1024);
+  const rss  = Math.round(mem.rss       / 1024 / 1024);
+  const ext  = Math.round(mem.external  / 1024 / 1024);
+
+  if (heap >= 350) {
+    const cleared = clearOldConversations(2 * 60_000);
+    // Force a V8 GC cycle if --expose-gc was passed (optional but powerful)
+    if (typeof (global as any).gc === "function") (global as any).gc();
+    logger.warn({ heap, rss, ext, cleared }, `[Memory] 🚨 CRITICAL ${heap}MB — emergency clear: ${cleared} convos freed`);
+  } else if (heap >= 300) {
+    const cleared = clearOldConversations(5 * 60_000);
+    logger.warn({ heap, rss, ext, cleared }, `[Memory] ⚠️  HIGH ${heap}MB — cleared ${cleared} inactive convos`);
+  } else if (heap >= 250) {
+    const cleared = clearOldConversations(15 * 60_000);
+    if (cleared > 0) {
+      logger.info({ heap, rss, ext, cleared }, `[Memory] 🟡 ELEVATED ${heap}MB — pre-emptive clear: ${cleared} convos freed`);
+    } else {
+      logger.info({ heap, rss, ext }, `[Memory] 🟡 ELEVATED ${heap}MB — no idle convos to clear`);
+    }
+  } else {
+    logger.info({ heap, rss, ext }, `[Memory] ✅ ${heap}MB heap | ${rss}MB RSS`);
+  }
+}, 60_000); // every 60 s — detect spikes twice as fast as before
 
 // Graceful shutdown — disconnect Discord bot immediately on SIGTERM/SIGINT so the
 // old instance stops handling interactions before the new one takes over.
