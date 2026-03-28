@@ -740,7 +740,7 @@ const commands = [
   // ── Twitter advance — sync last_tweet_id to actual latest (Admin only) ────
   new SlashCommandBuilder()
     .setName("twitteradvance")
-    .setDescription("Sync all accounts to their actual latest tweet — prevents old-tweet floods after proxy fixes (Admin only)")
+    .setDescription("Sync all accounts to current latest tweet — prevents old-tweet floods (Admin only)")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   // ── Joke auto-scheduler (Admin only) ──────────────────────────────────────
