@@ -15,6 +15,7 @@ import {
 } from "discord.js";
 import { generateWithFallback } from "@workspace/integrations-gemini-ai";
 import { pool }  from "@workspace/db";
+import { NEWS_SOURCES, setNewsChannel, stopNewsAlerts, getNewsConfig } from "./news-monitor.js";
 
 export interface AIPlugin {
   name:       string;
@@ -108,34 +109,40 @@ export const aiPluginCommands: AIPlugin[] = [
   },
 
   // ─── /news-alerts ─────────────────────────────────────────────────────────
+  // RSS-based breaking news from official Arabic / International / Japanese sources.
+  // No Twitter required — pulls directly from official websites every 15 minutes.
   {
     name: "news-alerts",
     guildId: null,
     definition: new SlashCommandBuilder()
       .setName("news-alerts")
-      .setDescription("Manage Twitter/X news alerts for a channel.")
+      .setDescription("Breaking news from official Arabic, international & Japanese sources.")
       .addSubcommand(sub =>
-        sub.setName("add")
-          .setDescription("Add a Twitter/X user to send alerts to a channel.")
-          .addStringOption(o => o.setName("username").setDescription("Twitter/X username (without @)").setRequired(true))
-          .addChannelOption(o => o.setName("channel").setDescription("Channel to post alerts in").setRequired(true))
+        sub.setName("set")
+          .setDescription("Set the channel where breaking news will be posted.")
+          .addChannelOption(o =>
+            o.setName("channel")
+             .setDescription("Text channel to receive news alerts")
+             .setRequired(true)
+          )
       )
       .addSubcommand(sub =>
-        sub.setName("remove")
-          .setDescription("Remove a Twitter/X user's alerts from a channel.")
-          .addStringOption(o => o.setName("username").setDescription("Twitter/X username (without @)").setRequired(true))
-          .addChannelOption(o => o.setName("channel").setDescription("Channel to remove alerts from").setRequired(true))
+        sub.setName("stop")
+          .setDescription("Stop posting news alerts in this server.")
       )
       .addSubcommand(sub =>
-        sub.setName("list")
-          .setDescription("List all active Twitter/X alerts for a channel.")
-          .addChannelOption(o => o.setName("channel").setDescription("Channel to list alerts for (defaults to current)").setRequired(false))
+        sub.setName("status")
+          .setDescription("Show current news alerts configuration and sources.")
       )
       .toJSON(),
+
     handler: async (interaction: ChatInputCommandInteraction): Promise<void> => {
       try {
         if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels)) {
-          await interaction.reply({ content: "You need 'Manage Channels' permission to use this command.", flags: MessageFlags.Ephemeral });
+          await interaction.reply({
+            content: "❌ تحتاج صلاحية **Manage Channels** لاستخدام هذا الأمر.",
+            flags: MessageFlags.Ephemeral,
+          });
           return;
         }
 
@@ -145,90 +152,92 @@ export const aiPluginCommands: AIPlugin[] = [
           return;
         }
 
-        // Ensure news_alerts table exists
-        await pool.query(`
-          CREATE TABLE IF NOT EXISTS news_alerts (
-            id               SERIAL PRIMARY KEY,
-            guild_id         TEXT NOT NULL,
-            channel_id       TEXT NOT NULL,
-            twitter_username TEXT NOT NULL,
-            created_at       TIMESTAMPTZ DEFAULT NOW(),
-            UNIQUE (guild_id, channel_id, twitter_username)
-          )
-        `);
+        const sub = interaction.options.getSubcommand();
 
-        const subcommand = interaction.options.getSubcommand();
-
-        if (subcommand === "add") {
+        // ── /news-alerts set ──────────────────────────────────────────────────
+        if (sub === "set") {
           await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-          const username = interaction.options.getString("username", true).replace(/^@/, "").trim();
           const channel = interaction.options.getChannel("channel", true) as any;
 
-          if (!(channel as any).isTextBased() || (channel as any).isVoiceBased()) {
-            await interaction.editReply({ content: `<#${channel.id}> is not a text channel.` });
+          if (!channel.isTextBased() || channel.isVoiceBased()) {
+            await interaction.editReply({ content: `❌ <#${channel.id}> ليست قناة نصية.` });
             return;
           }
 
-          const { rows: existing } = await pool.query(
-            "SELECT 1 FROM news_alerts WHERE guild_id = $1 AND channel_id = $2 AND twitter_username = $3",
-            [guildId, channel.id, username.toLowerCase()]
-          );
-          if (existing.length > 0) {
-            await interaction.editReply({ content: `Alerts for **@${username}** are already set up in <#${channel.id}>.` });
-            return;
-          }
+          await setNewsChannel(guildId, channel.id);
 
-          await pool.query(
-            "INSERT INTO news_alerts (guild_id, channel_id, twitter_username) VALUES ($1, $2, $3)",
-            [guildId, channel.id, username.toLowerCase()]
-          );
-          await interaction.editReply({ content: `✅ News alerts for **@${username}** will be posted in <#${channel.id}>.` });
-
-        } else if (subcommand === "remove") {
-          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-          const username = interaction.options.getString("username", true).replace(/^@/, "").trim();
-          const channel = interaction.options.getChannel("channel", true) as any;
-
-          const { rowCount } = await pool.query(
-            "DELETE FROM news_alerts WHERE guild_id = $1 AND channel_id = $2 AND twitter_username = $3",
-            [guildId, channel.id, username.toLowerCase()]
-          );
-          if (rowCount) {
-            await interaction.editReply({ content: `✅ Removed news alerts for **@${username}** from <#${channel.id}>.` });
-          } else {
-            await interaction.editReply({ content: `No alerts found for **@${username}** in <#${channel.id}>.` });
-          }
-
-        } else if (subcommand === "list") {
-          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-          const channel = (interaction.options.getChannel("channel") ?? interaction.channel) as any;
-
-          if (!channel) {
-            await interaction.editReply({ content: "Could not determine the channel." });
-            return;
-          }
-
-          const { rows } = await pool.query(
-            "SELECT twitter_username FROM news_alerts WHERE guild_id = $1 AND channel_id = $2 ORDER BY twitter_username ASC",
-            [guildId, channel.id]
-          );
-
-          if (rows.length === 0) {
-            await interaction.editReply({ content: `No news alerts configured for <#${channel.id}>.` });
-            return;
-          }
+          const arabicSources    = NEWS_SOURCES.filter(s => s.lang === "ar");
+          const intlSources      = NEWS_SOURCES.filter(s => s.lang === "en");
+          const japaneseSources  = NEWS_SOURCES.filter(s => s.lang === "ja");
 
           const embed = new EmbedBuilder()
-            .setTitle(`📰 News Alerts in #${channel.name}`)
-            .setColor(Colors.Blue)
-            .setDescription(rows.map((r: any) => `• @${r.twitter_username}`).join("\n"));
+            .setColor(Colors.Green)
+            .setTitle("📰 تم تفعيل الأخبار العاجلة")
+            .setDescription(`سيتم نشر الأخبار في <#${channel.id}> كل **15 دقيقة** تلقائياً.`)
+            .addFields(
+              {
+                name: "🌍 المصادر العربية",
+                value: arabicSources.map(s => `${s.flag} ${s.name}`).join("\n"),
+                inline: true,
+              },
+              {
+                name: "🌐 المصادر الدولية",
+                value: intlSources.map(s => `${s.flag} ${s.name}`).join("\n"),
+                inline: true,
+              },
+              {
+                name: "🇯🇵 المصادر اليابانية",
+                value: japaneseSources.map(s => `${s.flag} ${s.name}`).join("\n"),
+                inline: true,
+              },
+            )
+            .setFooter({ text: "أخبار مباشرة من المصادر الرسمية — بدون Twitter" });
+
+          await interaction.editReply({ embeds: [embed] });
+
+        // ── /news-alerts stop ─────────────────────────────────────────────────
+        } else if (sub === "stop") {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const stopped = await stopNewsAlerts(guildId);
+          if (stopped) {
+            await interaction.editReply({ content: "✅ تم إيقاف تنبيهات الأخبار لهذا السيرفر." });
+          } else {
+            await interaction.editReply({ content: "⚠️ لم تكن تنبيهات الأخبار مفعّلة." });
+          }
+
+        // ── /news-alerts status ───────────────────────────────────────────────
+        } else if (sub === "status") {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const config = await getNewsConfig(guildId);
+
+          if (!config) {
+            await interaction.editReply({
+              content: "📭 لم يتم إعداد تنبيهات الأخبار بعد.\nاستخدم `/news-alerts set` لتفعيلها.",
+            });
+            return;
+          }
+
+          const statusEmoji = config.enabled ? "✅ مفعّل" : "⛔ موقوف";
+          const embed = new EmbedBuilder()
+            .setColor(config.enabled ? Colors.Green : Colors.Red)
+            .setTitle("📰 حالة تنبيهات الأخبار")
+            .addFields(
+              { name: "الحالة",   value: statusEmoji,            inline: true },
+              { name: "القناة",   value: `<#${config.channelId}>`, inline: true },
+              { name: "عدد المصادر", value: `${NEWS_SOURCES.length} مصدر رسمي`, inline: true },
+              {
+                name: "المصادر",
+                value: NEWS_SOURCES.map(s => `${s.flag} ${s.name}`).join(" • "),
+              },
+            )
+            .setFooter({ text: "يتحقق كل 15 دقيقة — أخبار عاجلة مباشرة من المواقع الرسمية" });
 
           await interaction.editReply({ embeds: [embed] });
         }
 
       } catch (error) {
         console.error("[/news-alerts] Error:", error);
-        const msg = { content: "An error occurred. Please try again later." };
+        const msg = { content: "حدث خطأ، يرجى المحاولة مجدداً." };
         if (interaction.replied || interaction.deferred) {
           await interaction.editReply(msg).catch(() => {});
         } else {
