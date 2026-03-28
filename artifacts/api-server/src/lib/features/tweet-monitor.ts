@@ -677,56 +677,76 @@ async function fetchViaSyndication(
   return { tweets: filtered, source: "twitter:syndication" };
 }
 
-// ── Public entry — priority: Proxy → Twitter API v2 → GraphQL guest → Nitter RSS ──
+// ── Public entry — Syndication first (stable, works from Render) → Proxy → GraphQL → RSS ──
+//
+// Priority order — permanent design:
+//
+//  1. Syndication  — twitter.com embedded timeline endpoint. Works from cloud/Render IPs.
+//                    Always returns the chronological 20 latest tweets. No API key, no QID rotation.
+//                    This is the most stable source and must remain the first attempt.
+//
+//  2. Proxy        — Cloudflare Worker (GraphQL guest API). Useful for small/private accounts
+//                    not covered by Syndication, and as a second opinion.
+//
+//  3. Twitter v2   — Paid bearer token. Only available if TWITTER_BEARER_TOKEN is set.
+//
+//  4. GraphQL      — Direct guest API. Blocked from Render IPs but kept as fallback.
+//
+//  5. RSS          — Nitter/RSSHub. Last resort, most instances dead as of 2026.
+//
+// WHY Syndication first?
+//   GraphQL QIDs rotate every few weeks (Twitter changes their web app). When a QID breaks,
+//   the proxy falls back to "profileBestHighlights" which returns popular OLD tweets, not newest.
+//   Syndication is served by a stable CDN endpoint that does NOT use rotating QIDs.
+//   Moving it to position #1 makes the bot permanently immune to QID changes.
 export async function fetchLatestTweets(
   username: string,
   sinceId?: string | null,
 ): Promise<{ tweets: Tweet[]; source: string }> {
-  // 0. Proxy (Cloudflare Worker → bypasses Render IP blocks). Enabled only when TWITTER_PROXY_URL is set.
+
+  // ── 1. Syndication (stable, always chronological, works from Render IPs) ───
+  try {
+    const result = await fetchViaSyndication(username, sinceId);
+    // Accept if we got tweets. For sinceId mode: "0 new" is valid (means nothing new).
+    // For no-sinceId mode: only skip if literally 0 tweets total (account has no public posts).
+    if (sinceId != null || result.tweets.length > 0) return result;
+    console.warn(`[TweetMonitor] @${username} — Syndication returned 0 tweets (new account?), trying proxy`);
+  } catch (err: any) {
+    console.warn(`[TweetMonitor] @${username} — Syndication failed (${err.message}), trying proxy`);
+  }
+
+  // ── 2. Proxy — Cloudflare Worker (GraphQL guest API via CF IPs) ─────────────
   if (process.env.TWITTER_PROXY_URL) {
     try {
       const proxyResult = await fetchViaProxy(username, sinceId);
-      // If proxy returned tweets, we're done.
-      // If 0 tweets: fall through to syndication — the guest-token UserTweets API silently
-      // returns empty for small/new accounts (e.g. @1prime10) even when tweets exist.
-      // Syndication handles sinceId filtering client-side so no duplicate posts occur.
       if (proxyResult.tweets.length > 0) return proxyResult;
-      console.warn(`[TweetMonitor] @${username} — Proxy returned 0 tweets, falling through to syndication`);
+      console.warn(`[TweetMonitor] @${username} — Proxy returned 0 tweets, trying direct GraphQL`);
     } catch (err: any) {
       console.warn(`[TweetMonitor] @${username} — Proxy failed (${err.message}), trying direct GraphQL`);
     }
   }
 
-  // 1. Twitter API v2 (requires paid bearer token — most reliable if available)
+  // ── 3. Twitter API v2 (requires paid bearer token) ──────────────────────────
   const token = getBearerToken();
   if (token) {
     try {
       return await fetchViaTwitterApiV2(username, sinceId);
     } catch (err: any) {
-      console.warn(`[TweetMonitor] @${username} — Twitter API v2 failed (${err.message}), falling back to GraphQL guest API`);
+      console.warn(`[TweetMonitor] @${username} — Twitter API v2 failed (${err.message}), trying GraphQL guest`);
     }
   }
 
-  // 2. Twitter GraphQL guest API (free, no key needed — uses same bearer as twitter.com web app)
-  //    NOTE: blocked from Render/cloud IPs; works from Replit IPs (used by proxy endpoint).
+  // ── 4. Twitter GraphQL guest API (blocked from Render IPs — last direct attempt) ──
   try {
     return await fetchViaTwitterGraphQL(username, sinceId);
   } catch (err: any) {
-    console.warn(`[TweetMonitor] @${username} — Twitter GraphQL failed (${err.message}), falling back to syndication`);
+    console.warn(`[TweetMonitor] @${username} — Twitter GraphQL failed (${err.message}), trying Nitter RSS`);
   }
 
-  // 3. Twitter Syndication API (embedded-timeline endpoint — works from cloud IPs)
-  try {
-    return await fetchViaSyndication(username, sinceId);
-  } catch (err: any) {
-    console.warn(`[TweetMonitor] @${username} — Syndication failed (${err.message}), falling back to Nitter RSS`);
-  }
-
-  // 4. Nitter/RSSHub RSS (last resort — most public instances are dead/blocked as of 2026-03)
+  // ── 5. Nitter/RSSHub RSS (last resort) ──────────────────────────────────────
   const { tweets, source } = await fetchViaRss(username);
   if (sinceId && isNumericId(sinceId)) {
-    const filtered = tweets.filter(t => isNumericId(t.id) && BigInt(t.id) > BigInt(sinceId));
-    return { tweets: filtered, source };
+    return { tweets: tweets.filter(t => isNumericId(t.id) && BigInt(t.id) > BigInt(sinceId)), source };
   }
   return { tweets, source };
 }
