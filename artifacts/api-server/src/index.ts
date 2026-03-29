@@ -75,38 +75,55 @@ setInterval(async () => {
 }, 3 * 60_000); // every 3 minutes (2-minute safety margin before 5-min idle limit)
 
 // ─── Memory watchdog ──────────────────────────────────────────────────────────
-// Render free tier: 512 MB RAM / 384 MB heap cap.
-// Checks every 60 s (was 2 min) — catches spikes twice as fast.
-// Four tiers:
-//   < 250 MB  → normal, just log
-//   ≥ 250 MB  → pre-emptive: evict conversations idle > 15 min
-//   ≥ 300 MB  → warning:     evict conversations idle >  5 min
-//   ≥ 350 MB  → critical:    evict conversations idle >  2 min + force GC
+// Render free tier: 512 MB total RAM / 384 MB heap cap.
+// Thresholds lowered by 50 MB each to give more headroom before OOM kill.
+// Now also monitors RSS (total process memory) — Render kills at 512 MB RSS.
+//   RSS ≥ 460 MB → DANGER: voluntary exit before Render OOM-kills us (exit 1 → instant restart)
+//   heap ≥ 300 MB → critical: force GC + evict
+//   heap ≥ 250 MB → warning: evict 5 min idle
+//   heap ≥ 200 MB → elevated: evict 15 min idle
 setInterval(() => {
   const mem  = process.memoryUsage();
   const heap = Math.round(mem.heapUsed  / 1024 / 1024);
   const rss  = Math.round(mem.rss       / 1024 / 1024);
   const ext  = Math.round(mem.external  / 1024 / 1024);
 
-  if (heap >= 350) {
+  // ── RSS guard: voluntary restart before Render OOM-kills us ────────────────
+  // OOM kill = no clean-up, no SIGTERM, Render restart takes longer.
+  // Voluntary exit(1) = Render restarts immediately with a clean process.
+  if (rss >= 460) {
+    logger.error({ heap, rss, ext }, `[Memory] ☠️ RSS ${rss}MB — approaching Render OOM limit (512MB). Voluntary restart.`);
+    process.exit(1);
+  }
+
+  if (heap >= 300) {
     const cleared = clearOldConversations(2 * 60_000);
-    // Force a V8 GC cycle if --expose-gc was passed (optional but powerful)
     if (typeof (global as any).gc === "function") (global as any).gc();
-    logger.warn({ heap, rss, ext, cleared }, `[Memory] 🚨 CRITICAL ${heap}MB — emergency clear: ${cleared} convos freed`);
-  } else if (heap >= 300) {
-    const cleared = clearOldConversations(5 * 60_000);
-    logger.warn({ heap, rss, ext, cleared }, `[Memory] ⚠️  HIGH ${heap}MB — cleared ${cleared} inactive convos`);
+    logger.warn({ heap, rss, ext, cleared }, `[Memory] 🚨 CRITICAL ${heap}MB heap — GC + emergency clear: ${cleared} convos freed`);
   } else if (heap >= 250) {
+    const cleared = clearOldConversations(5 * 60_000);
+    if (typeof (global as any).gc === "function") (global as any).gc();
+    logger.warn({ heap, rss, ext, cleared }, `[Memory] ⚠️  HIGH ${heap}MB heap — cleared ${cleared} inactive convos`);
+  } else if (heap >= 200) {
     const cleared = clearOldConversations(15 * 60_000);
     if (cleared > 0) {
-      logger.info({ heap, rss, ext, cleared }, `[Memory] 🟡 ELEVATED ${heap}MB — pre-emptive clear: ${cleared} convos freed`);
+      logger.info({ heap, rss, ext, cleared }, `[Memory] 🟡 ELEVATED ${heap}MB heap — pre-emptive clear: ${cleared} convos freed`);
     } else {
-      logger.info({ heap, rss, ext }, `[Memory] 🟡 ELEVATED ${heap}MB — no idle convos to clear`);
+      logger.info({ heap, rss, ext }, `[Memory] 🟡 ELEVATED ${heap}MB heap | ${rss}MB RSS`);
     }
   } else {
     logger.info({ heap, rss, ext }, `[Memory] ✅ ${heap}MB heap | ${rss}MB RSS`);
   }
-}, 60_000); // every 60 s — detect spikes twice as fast as before
+}, 30_000); // every 30 s (was 60 s) — catch spikes faster
+
+// ─── Proactive GC every 5 minutes ─────────────────────────────────────────────
+// Forces V8 to collect garbage proactively even when heap looks normal.
+// Prevents slow creep accumulation that causes sudden OOM during burst sends.
+setInterval(() => {
+  if (typeof (global as any).gc === "function") {
+    (global as any).gc();
+  }
+}, 5 * 60_000);
 
 // Graceful shutdown — disconnect Discord bot immediately on SIGTERM/SIGINT so the
 // old instance stops handling interactions before the new one takes over.
