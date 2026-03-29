@@ -645,17 +645,20 @@ async function connect(token: string): Promise<void> {
     // members that haven't been fetched in the last hour every 10 min.
     makeCache: Options.cacheWithLimits({
       ...Options.DefaultMakeCacheSettings,
-      MessageManager: 200,       // keep max 200 msgs per channel
-      ReactionManager: 100,
+      MessageManager: 50,        // was 200 — reduce to 50 (saves ~30-50 MB on active servers)
+      ReactionManager: 50,       // was 100
+      GuildEmojiManager: 0,      // emojis rarely needed in cache
+      PresenceManager: 0,        // presence data is expensive, not needed
+      VoiceStateManager: 10,     // only need a few voice states
     }),
     sweepers: {
       ...Options.DefaultSweeperSettings,
       messages: {
-        interval: 300,           // run every 5 minutes (seconds)
-        lifetime:  1_800,        // remove messages older than 30 minutes
+        interval: 120,           // run every 2 minutes (was 5)
+        lifetime:  600,          // remove messages older than 10 minutes (was 30)
       },
       guildMembers: {
-        interval: 600,           // run every 10 minutes
+        interval: 300,           // run every 5 minutes (was 10)
         filter:   Options.DefaultSweeperSettings.guildMembers?.filter
                   ?? (() => () => false),
       },
