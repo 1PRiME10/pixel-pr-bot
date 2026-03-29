@@ -86,10 +86,14 @@ import { pool } from "@workspace/db";
 let client: Client | null = null;
 let startTime: Date | null = null;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_DELAY_MS = 300_000; // 5 minutes max
+const MAX_RECONNECT_DELAY_MS = 120_000; // 2 minutes max (was 5 min — faster recovery)
 let reconnectPending = false;
 let watchdogInterval: ReturnType<typeof setInterval> | null = null;
 let connectStartTime = 0; // tracks when the last connect() started
+// Tracks when the bot FIRST went offline — used by the dead-man's switch.
+// Reset to null every time the bot becomes Ready. Never reset by individual
+// reconnect attempts so we can measure total continuous offline duration.
+let firstDisconnectTime: number | null = null;
 // ── Leak prevention: track reconnect-spawned intervals so we can clear them ──
 // Every connect() spawns a status-cycle and (optionally) a schedule ticker.
 // Without clearing them, each reconnect adds two permanent intervals that
@@ -681,6 +685,7 @@ async function connect(token: string): Promise<void> {
     startTime = new Date();
     reconnectAttempts = 0;
     reconnectPending = false;
+    firstDisconnectTime = null; // ← back online, reset the dead-man's clock
     // Cache mention regex once — avoids `new RegExp()` on every message
     cachedMentionRegex = new RegExp(`^<@!?${c.user.id}>\\s*`);
     console.log(`Discord bot ready: Logged in as ${c.user.tag}`);
@@ -820,6 +825,21 @@ async function connect(token: string): Promise<void> {
 
     if (!client || !client.isReady()) {
       highPingStrikes = 0;
+      // ── Dead-man's switch ────────────────────────────────────────────────────
+      // If we've been offline for >15 min as the elected leader on Render,
+      // the reconnect backoff loop is stuck. Force process.exit(1) so Render
+      // restarts a fresh instance that connects in <30 seconds.
+      // Without this, a stuck reconnect loop can keep the bot down for HOURS.
+      if (IS_RENDER && isElectedLeader && !manuallyPaused && firstDisconnectTime) {
+        const offlineMs = Date.now() - firstDisconnectTime;
+        if (offlineMs > 15 * 60_000) {
+          console.error(
+            `[Watchdog] ☠️ Bot offline for ${Math.round(offlineMs / 60_000)} min — ` +
+            `forcing clean restart so Render brings up a fresh instance.`
+          );
+          process.exit(1); // Render will restart immediately
+        }
+      }
       console.warn("[Watchdog] Client not ready — forcing reconnect...");
       scheduleReconnect(token);
       return;
@@ -1500,6 +1520,10 @@ async function connect(token: string): Promise<void> {
 function scheduleReconnect(token: string): void {
   if (reconnectPending) return; // already scheduled, skip
   reconnectPending = true;
+  // Start the dead-man's clock on FIRST disconnect — never reset it here
+  if (!firstDisconnectTime) firstDisconnectTime = Date.now();
+  // Cap reconnect attempts at 8 — prevents permanent 5-min delays after session resets
+  if (reconnectAttempts > 8) reconnectAttempts = 4;
   const delay = getReconnectDelay();
   reconnectAttempts++;
   console.log(`Reconnecting in ${delay / 1000}s (attempt ${reconnectAttempts})...`);
