@@ -187,6 +187,10 @@ function getHistory(userId: string, guildId: string): Turn[] {
   return conv.history;
 }
 
+// Hard cap on conversations Map — prevents unbounded growth under heavy traffic.
+// At 10 turns × ~200 chars each, 1000 entries ≈ 2 MB — safe for a 512 MB container.
+const MAX_CONVERSATIONS = 1_000;
+
 function saveHistory(userId: string, guildId: string, userText: string, botText: string) {
   const key     = historyKey(userId, guildId);
   const history = getHistory(userId, guildId);
@@ -194,6 +198,11 @@ function saveHistory(userId: string, guildId: string, userText: string, botText:
   history.push({ role: "model", text: botText });
   // Trim oldest turns beyond the limit
   while (history.length > MAX_HISTORY_PAIRS * 2) history.shift();
+  // Hard size cap: evict the oldest entry when Map is full
+  if (conversations.size >= MAX_CONVERSATIONS && !conversations.has(key)) {
+    const oldest = conversations.keys().next().value;
+    if (oldest) conversations.delete(oldest);
+  }
   conversations.set(key, { history, lastActive: Date.now() });
 }
 
@@ -1547,15 +1556,16 @@ function scheduleReconnect(token: string): void {
 // lock goes stale after 60 s and the next standby can take over.
 
 const LEADER_ROW_ID        = "discord_leader";
-const LEADER_HEARTBEAT_MS  = 5_000;   // refresh lock every 5 s
-// Render (production) can take the lock as soon as it's 8 s stale.
-// 8 s > 5 s heartbeat — gives the active leader a 3 s safety margin.
+// Heartbeat every 20 s — keeps DB write rate at 3/min (was 12/min at 5 s).
+// Stale window 90 s = 4.5× heartbeat → 70 s safety margin before any
+// standby can steal the lock. Any DB latency spike must sustain >70 s
+// continuously to cause a leader flip — effectively impossible on Render.
+const LEADER_HEARTBEAT_MS  = 20_000;  // refresh lock every 20 s (was 5 s — too aggressive)
 // Non-Render (Replit/dev) waits 5 minutes — so Render redeploys never
 // cause Replit to accidentally take over and create double-replies.
 const IS_RENDER        = !!process.env.RENDER;
-// 8 s stale window on Render: 5 s heartbeat + 3 s safety margin.
-// Faster than 12 s → new instance takes over in ≤8 s after crash, not 12 s.
-const LEADER_STALE_MS  = IS_RENDER ? 8_000 : 300_000;
+// 90 s stale on Render: 20 s heartbeat + 70 s safety margin (was 8 s → 3 s margin — dangerously thin).
+const LEADER_STALE_MS  = IS_RENDER ? 90_000 : 300_000;
 
 // ─── Render Keep-Alive ────────────────────────────────────────────────────────
 // Render free tier spins the service DOWN after 15 min of no inbound HTTP.
@@ -1585,9 +1595,11 @@ function startKeepAlive(): void {
 
   // Use the lightweight /health endpoint — zero DB/Discord dependency, responds in <1ms.
   // Never use /api/healthz here (it runs a DB query on every ping).
-  // Render free tier spins down after 15 min of inactivity — ping every 10 min is safe.
+  // Render free tier spins down after 15 min of inactivity — 5 min ping is plenty.
+  // IMPORTANT: was 10_000 ms (every 10 SECONDS = 360 pings/hour) — a typo that wasted
+  // resources and added unnecessary HTTP load on a RAM-constrained container.
   const pingUrl = `${base}/health`;
-  console.log(`[KeepAlive] Pinging ${pingUrl} every 10s to prevent Render free-tier sleep`);
+  console.log(`[KeepAlive] Pinging ${pingUrl} every 5 min to prevent Render free-tier sleep`);
 
   const doPing = async () => {
     try {
@@ -1598,8 +1610,8 @@ function startKeepAlive(): void {
     }
   };
 
-  doPing();                      // fire immediately on cold start
-  setInterval(doPing, 10_000);   // then every 10 seconds
+  doPing();                               // fire immediately on cold start
+  setInterval(doPing, 5 * 60_000);        // then every 5 minutes (was 10s — 30× too frequent)
 }
 
 async function ensureLeaderTable(): Promise<void> {
@@ -1731,8 +1743,9 @@ export async function initBot(): Promise<void> {
       console.log("[Leader] Dev/Replit — will NOT auto-promote. Only Render owns Discord in production.");
       return;
     }
-    // Render only: retry leadership every 2 s — faster takeover after crash/redeploy.
-    // Fast retry + 8 s stale window = new instance takes Discord in ≤ 10 s after old dies.
+    // Render only: retry leadership every 20 s — safe with 90 s stale window.
+    // 90 s stale / 20 s retry = new instance takes Discord in ≤ 110 s after old dies.
+    // Was 2 s (30 DB queries/min from standbys) — wasteful and caused pool pressure.
     setInterval(async () => {
       if (isElectedLeader) return; // already promoted — stop retrying
       try {
@@ -1749,7 +1762,7 @@ export async function initBot(): Promise<void> {
         console.error("[Leader] Standby promotion failed — will retry in 2s:", (err as Error)?.message ?? err);
         isElectedLeader = false;
       }
-    }, 2_000);
+    }, 20_000); // every 20 s (was 2 s — 10× too frequent, caused DB pool pressure)
     return;
   }
 
