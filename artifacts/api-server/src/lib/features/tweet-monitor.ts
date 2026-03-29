@@ -311,6 +311,9 @@ export async function initTweetMonitor(): Promise<void> {
   await pool.query(`ALTER TABLE tweet_monitors ADD COLUMN IF NOT EXISTS twitter_user_id TEXT`).catch(() => {});
   await pool.query(`ALTER TABLE tweet_monitors ADD COLUMN IF NOT EXISTS last_error TEXT`).catch(() => {});
 
+  // Sync account list to GitHub so the Actions workflow fetches the right accounts
+  syncAccountsToGitHub().catch(() => {});
+
   // On startup: reset ALL non-permanently-unreachable accounts so they get
   // a fresh attempt on the first poll cycle after restart.
   // Accounts that hit DEAD_THRESHOLD (30 failures) are left marked unreachable.
@@ -460,6 +463,108 @@ async function fetchViaRss(username: string): Promise<{ tweets: Tweet[]; source:
   }
 
   throw new Error(`All RSS sources failed for @${username}. Errors: ${errors.slice(0, 3).join(" | ")}`);
+}
+
+// ─── GitHub Actions Cache — reads pre-fetched tweets from the repo ────────────
+// The GitHub Actions workflow (.github/workflows/twitter-fetch.yml) runs every
+// 5 minutes and fetches tweets from GitHub's (Azure) IPs — not blocked by Twitter.
+// Results are committed to twitter-cache/{username}.json in the repo.
+// Bot reads these files via GitHub API. This is the most reliable free source.
+//
+// Required env vars (set on Render):
+//   GITHUB_REPO   = 1PRiME10/pixel-pr-bot
+//   GITHUB_PAT    = ghp_... (PAT with repo read access)
+const GITHUB_CACHE_REPO = process.env.GITHUB_REPO ?? "1PRiME10/pixel-pr-bot";
+const GITHUB_CACHE_MAX_AGE_MS = 12 * 60_000; // reject cache older than 12 min
+
+async function fetchViaGitHubCache(
+  username: string,
+  sinceId?: string | null,
+): Promise<{ tweets: Tweet[]; source: string }> {
+  const pat = process.env.GITHUB_PAT;
+  if (!pat) throw new Error("GITHUB_PAT not set");
+
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github.v3.raw",
+    "User-Agent": "PIXEL_PR_Bot/2.0",
+    Authorization: `Bearer ${pat}`,
+  };
+
+  const apiUrl = `https://api.github.com/repos/${GITHUB_CACHE_REPO}/contents/twitter-cache/${username.toLowerCase()}.json`;
+  const resp = await fetch(apiUrl, { headers, signal: AbortSignal.timeout(10_000) });
+
+  if (resp.status === 404) throw new Error(`GitHub cache: no file for @${username} yet`);
+  if (!resp.ok) throw new Error(`GitHub cache HTTP ${resp.status}`);
+
+  const data = await resp.json() as { tweets?: Tweet[]; fetchedAt?: string; lastError?: string };
+
+  // Reject stale cache
+  if (!data.fetchedAt) throw new Error("GitHub cache: missing fetchedAt");
+  const age = Date.now() - new Date(data.fetchedAt).getTime();
+  if (age > GITHUB_CACHE_MAX_AGE_MS) {
+    throw new Error(`GitHub cache stale (${Math.round(age / 60_000)}m old — max ${GITHUB_CACHE_MAX_AGE_MS / 60_000}m)`);
+  }
+
+  const tweets: Tweet[] = data.tweets ?? [];
+  const filtered = (sinceId && isNumericId(sinceId))
+    ? tweets.filter(t => isNumericId(t.id) && BigInt(t.id) > BigInt(sinceId))
+    : tweets;
+
+  console.log(`[TweetMonitor] @${username} ✓ GitHub cache (age ${Math.round(age / 1000)}s) — ${filtered.length}/${tweets.length} new`);
+  return { tweets: filtered, source: "github-cache" };
+}
+
+// ── Sync account list to twitter-cache/accounts.json in the GitHub repo ───────
+// Called on startup + when accounts are added/removed so the Action fetches
+// the right set of accounts.
+export async function syncAccountsToGitHub(): Promise<void> {
+  const pat = process.env.GITHUB_PAT;
+  if (!pat) return; // silently skip if not configured
+
+  try {
+    // Get all unique accounts from DB
+    const result = await pool.query(`SELECT DISTINCT twitter_user FROM tweet_monitors ORDER BY twitter_user`);
+    const accounts: string[] = result.rows.map((r: any) => r.twitter_user as string);
+
+    const content = Buffer.from(JSON.stringify({ accounts }, null, 2)).toString("base64");
+    const apiUrl = `https://api.github.com/repos/${GITHUB_CACHE_REPO}/contents/twitter-cache/accounts.json`;
+
+    // Get current file SHA (required for updates)
+    const getResp = await fetch(apiUrl, {
+      headers: {
+        Authorization: `Bearer ${pat}`,
+        Accept: "application/vnd.github.v3+json",
+        "User-Agent": "PIXEL_PR_Bot/2.0",
+      },
+    });
+    const current = getResp.ok ? await getResp.json() as { sha?: string } : null;
+    const sha = current?.sha;
+
+    // Update file
+    const putResp = await fetch(apiUrl, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${pat}`,
+        Accept: "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+        "User-Agent": "PIXEL_PR_Bot/2.0",
+      },
+      body: JSON.stringify({
+        message: "chore: sync twitter accounts [skip ci]",
+        content,
+        ...(sha ? { sha } : {}),
+      }),
+    });
+
+    if (putResp.ok) {
+      console.log(`[TweetMonitor] ✓ Synced ${accounts.length} account(s) to GitHub cache accounts.json`);
+    } else {
+      const body = await putResp.text().catch(() => "");
+      console.warn(`[TweetMonitor] Failed to sync accounts to GitHub: HTTP ${putResp.status} — ${body.slice(0, 100)}`);
+    }
+  } catch (e: any) {
+    console.warn(`[TweetMonitor] syncAccountsToGitHub error: ${e.message}`);
+  }
 }
 
 // ─── Proxy fetch — routes through Replit (its IPs are NOT blocked by Twitter) ─
@@ -703,6 +808,20 @@ export async function fetchLatestTweets(
   username: string,
   sinceId?: string | null,
 ): Promise<{ tweets: Tweet[]; source: string }> {
+
+  // ── 0. GitHub Actions Cache (most reliable — fetched from Azure IPs every 5 min) ──
+  // GitHub Actions IPs are not on Twitter's blocklist. The cache is fresh (< 12 min).
+  // If fresh and returns 0 new tweets → genuinely nothing new, return immediately.
+  // If stale or unavailable → fall through to live sources.
+  if (process.env.GITHUB_PAT) {
+    try {
+      const cached = await fetchViaGitHubCache(username, sinceId);
+      return cached; // trust cache — 0 new tweets is a valid "nothing new" result
+    } catch (err: any) {
+      // Stale cache or file not yet created → fall through to live sources
+      console.warn(`[TweetMonitor] @${username} — GitHub cache unavailable (${err.message}), trying live sources`);
+    }
+  }
 
   // ── 1. Syndication (stable, always chronological, works from Render IPs) ───
   //
@@ -1150,6 +1269,8 @@ export async function addTwitterAccount(
                    fail_count = 0, last_fail_at = NULL, unreachable = FALSE`,
     [guildId, channelId, username, latestId],
   );
+  // Sync account list to GitHub so the Action starts fetching this account
+  syncAccountsToGitHub().catch(() => {});
   return { verified };
 }
 
@@ -1158,6 +1279,8 @@ export async function removeTwitterAccount(guildId: string, username: string): P
     `DELETE FROM tweet_monitors WHERE guild_id = $1 AND twitter_user = $2 RETURNING id`,
     [guildId, username],
   );
+  // Sync account list to GitHub (removes account if no other guild monitors it)
+  syncAccountsToGitHub().catch(() => {});
   return (res.rowCount ?? 0) > 0;
 }
 
