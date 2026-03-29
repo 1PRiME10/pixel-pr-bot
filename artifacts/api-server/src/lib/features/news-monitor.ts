@@ -15,7 +15,7 @@ import {
 import Parser from "rss-parser";
 import { pool } from "@workspace/db";
 
-const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes (was 5 — halves RSS fetch rate, no user impact)
 const LOCK_KEY         = 998877665;       // unique advisory lock key
 const MAX_SEEN_AGE_MS  = 7 * 24 * 60 * 60 * 1000; // 7 days
 
