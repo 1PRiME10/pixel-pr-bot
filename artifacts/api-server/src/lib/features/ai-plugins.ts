@@ -15,8 +15,8 @@ import {
 } from "discord.js";
 import { generateWithFallback } from "@workspace/integrations-gemini-ai";
 import { pool }  from "@workspace/db";
-import { NEWS_SOURCES, setNewsChannel, stopNewsAlerts, getNewsConfig } from "./news-monitor.js";
-import { TV_SOURCES, setTVNewsChannel, stopTVNews, getTVNewsConfig } from "./tv-news-monitor.js";
+import { NEWS_SOURCES, setNewsChannel, stopNewsAlerts, getNewsConfig, removeNewsChannel } from "./news-monitor.js";
+import { TV_SOURCES, setTVNewsChannel, stopTVNews, getTVNewsConfig, removeTVNewsChannel } from "./tv-news-monitor.js";
 
 export interface AIPlugin {
   name:       string;
@@ -138,6 +138,20 @@ export const aiPluginCommands: AIPlugin[] = [
           )
       )
       .addSubcommand(sub =>
+        sub.setName("remove")
+          .setDescription("Remove a specific region channel without affecting the others.")
+          .addStringOption(o =>
+            o.setName("region")
+             .setDescription("Which region to remove")
+             .setRequired(true)
+             .addChoices(
+               { name: "Arabic",        value: "ar" },
+               { name: "International", value: "en" },
+               { name: "Japanese",      value: "ja" },
+             )
+          )
+      )
+      .addSubcommand(sub =>
         sub.setName("stop")
           .setDescription("Stop posting news alerts in this server.")
       )
@@ -224,6 +238,18 @@ export const aiPluginCommands: AIPlugin[] = [
 
           await interaction.editReply({ embeds: [embed] });
 
+        // ── /news-alerts remove ───────────────────────────────────────────────
+        } else if (sub === "remove") {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const region = interaction.options.getString("region", true) as "ar" | "en" | "ja";
+          const label  = region === "ar" ? "🌍 Arabic" : region === "en" ? "🌐 International" : "🇯🇵 Japanese";
+          const removed = await removeNewsChannel(guildId, region);
+          if (removed) {
+            await interaction.editReply({ content: `✅ **${label}** news channel has been removed. Other regions are unaffected.` });
+          } else {
+            await interaction.editReply({ content: `⚠️ News alerts are not configured for this server.` });
+          }
+
         // ── /news-alerts stop ─────────────────────────────────────────────────
         } else if (sub === "stop") {
           await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -300,6 +326,20 @@ export const aiPluginCommands: AIPlugin[] = [
             o.setName("korean-channel")
              .setDescription("Channel for Korean drama & K-pop news (Soompi, Dramabeans, Koreaboo)")
              .setRequired(false)
+          )
+      )
+      .addSubcommand(sub =>
+        sub.setName("remove")
+          .setDescription("Remove a specific category channel without affecting the others.")
+          .addStringOption(o =>
+            o.setName("category")
+             .setDescription("Which category to remove")
+             .setRequired(true)
+             .addChoices(
+               { name: "Anime & Manga", value: "anime" },
+               { name: "Film & TV",     value: "intl"  },
+               { name: "Korean",        value: "kr"    },
+             )
           )
       )
       .addSubcommand(sub =>
@@ -387,6 +427,18 @@ export const aiPluginCommands: AIPlugin[] = [
             .setFooter({ text: "Only configured categories will receive news." });
 
           await interaction.editReply({ embeds: [embed] });
+
+        // ── /tv-news remove ───────────────────────────────────────────────────
+        } else if (sub === "remove") {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const category = interaction.options.getString("category", true) as "anime" | "intl" | "kr";
+          const label = category === "anime" ? "🎌 Anime & Manga" : category === "intl" ? "🎬 Film & TV" : "🇰🇷 Korean";
+          const removed = await removeTVNewsChannel(guildId, category);
+          if (removed) {
+            await interaction.editReply({ content: `✅ **${label}** news channel has been removed. Other categories are unaffected.` });
+          } else {
+            await interaction.editReply({ content: `⚠️ TV news is not configured for this server.` });
+          }
 
         // ── /tv-news stop ─────────────────────────────────────────────────────
         } else if (sub === "stop") {
