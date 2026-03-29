@@ -188,6 +188,17 @@ export async function setNewsChannel(guildId: string, channels: NewsChannels): P
   }
 }
 
+export type NewsChannelKey = "ar" | "en" | "ja";
+
+export async function removeNewsChannel(guildId: string, key: NewsChannelKey): Promise<boolean> {
+  const col = key === "ar" ? "channel_id_ar" : key === "en" ? "channel_id_en" : "channel_id_ja";
+  const { rowCount } = await pool.query(
+    `UPDATE news_feed_config SET ${col} = NULL WHERE guild_id = $1`,
+    [guildId]
+  );
+  return (rowCount ?? 0) > 0;
+}
+
 export async function stopNewsAlerts(guildId: string): Promise<boolean> {
   const { rowCount } = await pool.query(
     `UPDATE news_feed_config SET enabled = FALSE WHERE guild_id = $1`,
