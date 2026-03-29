@@ -204,6 +204,17 @@ export async function setTVNewsChannel(guildId: string, channels: TVChannels): P
   }
 }
 
+export type TVChannelKey = "anime" | "intl" | "kr";
+
+export async function removeTVNewsChannel(guildId: string, key: TVChannelKey): Promise<boolean> {
+  const col = key === "anime" ? "channel_id_anime" : key === "intl" ? "channel_id_intl" : "channel_id_kr";
+  const { rowCount } = await pool.query(
+    `UPDATE tv_news_config SET ${col} = NULL WHERE guild_id = $1`,
+    [guildId]
+  );
+  return (rowCount ?? 0) > 0;
+}
+
 export async function stopTVNews(guildId: string): Promise<boolean> {
   const { rowCount } = await pool.query(
     `UPDATE tv_news_config SET enabled = FALSE WHERE guild_id = $1`,
