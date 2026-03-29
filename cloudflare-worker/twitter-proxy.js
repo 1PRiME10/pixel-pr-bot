@@ -293,20 +293,35 @@ export default {
       let usedQid = null;
 
       if (sinceId && /^\d+$/.test(sinceId)) {
-        // POLLING mode: try Syndication first (always has the chronological latest)
-        const syndicationTweets = await fetchViaSyndication(username, sinceId).catch(() => null);
-        if (syndicationTweets && syndicationTweets.length > 0) {
-          resultTweets = syndicationTweets;
-          resultSource = "cf-worker:syndication";
-        } else {
-          // Syndication empty → try GraphQL
-          try {
-            const gql = await fetchGraphQL(sinceId);
-            resultTweets = gql.tweets;
-            usedQid = gql.qid;
-            resultSource = "cf-worker:graphql";
-          } catch (_e) {
-            resultTweets = [];
+        // POLLING mode: skip Syndication here — the caller (Render) already tried it and got 0.
+        // Hitting the same CDN URL again returns the same stale cache → wasted round-trip.
+        // Go straight to GraphQL which is the only real-time source.
+        try {
+          const gql = await fetchGraphQL(sinceId);
+          resultTweets = gql.tweets;
+          usedQid = gql.qid;
+          resultSource = "cf-worker:graphql";
+          // GraphQL returned 0 with sinceId → verify with a fresh (no sinceId) call
+          // to detect stale-cache misses where GraphQL thinks there's nothing new.
+          if (resultTweets.length === 0) {
+            try {
+              const fresh = await fetchGraphQL(null);
+              if (fresh.tweets.length > 0) {
+                const newest = fresh.tweets[0]; // already sorted newest-first
+                if (newest && /^\d+$/.test(newest.id) && BigInt(newest.id) > BigInt(sinceId)) {
+                  // There IS a newer tweet — recover all missed ones
+                  resultTweets = fresh.tweets.filter(t => /^\d+$/.test(t.id) && BigInt(t.id) > BigInt(sinceId));
+                  resultSource = "cf-worker:graphql-recovery";
+                }
+              }
+            } catch (_e) { /* recovery failed — return empty */ }
+          }
+        } catch (_e) {
+          // GraphQL failed — last resort: try Syndication (may still have the tweet if CDN updated)
+          const syndicationTweets = await fetchViaSyndication(username, sinceId).catch(() => null);
+          if (syndicationTweets && syndicationTweets.length > 0) {
+            resultTweets = syndicationTweets;
+            resultSource = "cf-worker:syndication-fallback";
           }
         }
       } else {
