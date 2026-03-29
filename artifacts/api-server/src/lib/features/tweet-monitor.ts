@@ -14,7 +14,7 @@ import {
 import { pool } from "@workspace/db";
 
 const PREFIX = "!";
-const POLL_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes (GraphQL guest API has no strict rate limit)
+const POLL_INTERVAL_MS = 2 * 60 * 1000; // every 2 minutes — faster catch after CDN cache updates
 
 // After this many consecutive failures → slow-retry (once every 6 hours)
 const FAILURE_THRESHOLD = 5;
