@@ -615,7 +615,8 @@ const commands = [
               { name: "🗓️ Monthly",             value: "monthly" },
             ))
         .addRoleOption(o => o.setName("role").setDescription("Role to ping in reminders (optional)").setRequired(false))
-        .addStringOption(o => o.setName("banner").setDescription("Banner image URL for the embed (optional)").setRequired(false)))
+        .addStringOption(o => o.setName("banner").setDescription("Banner image URL for the embed (optional)").setRequired(false))
+        .addStringOption(o => o.setName("end_date").setDescription("Stop repeating after: YYYY-MM-DD HH:MM (for recurring events only)").setRequired(false)))
     .addSubcommand(s =>
       s.setName("list")
         .setDescription("Show all upcoming events in this server")
@@ -653,7 +654,8 @@ const commands = [
             .addChoices(
               { name: "❌ No repeat", value: "none" }, { name: "📆 Daily", value: "daily" },
               { name: "📅 Weekly", value: "weekly" }, { name: "🗓️ Monthly", value: "monthly" },
-            ))),
+            ))
+        .addStringOption(o => o.setName("end_date").setDescription("Stop repeating after: YYYY-MM-DD HH:MM").setRequired(false))),
 
   // ── Self-Heal / System Health ──────────────────────────────────────────────
   new SlashCommandBuilder()
@@ -3003,6 +3005,7 @@ function handleInteractions(client: Client): void {
           const recurring   = (interaction.options.getString("recurring") ?? "none") as RecurType;
           const role        = interaction.options.getRole("role");
           const banner      = interaction.options.getString("banner") ?? null;
+          const endDateStr  = interaction.options.getString("end_date") ?? null;
 
           const eventAt = parseEventDate(datetimeStr);
           if (!eventAt) {
@@ -3015,18 +3018,26 @@ function handleInteractions(client: Client): void {
             await interaction.reply({ content: "❌ Title too long (max 100 characters).", flags: MessageFlags.Ephemeral }); return;
           }
 
+          let endsAt: Date | null = null;
+          if (endDateStr) {
+            endsAt = parseEventDate(endDateStr);
+            if (!endsAt) { await interaction.reply({ content: "❌ Invalid end_date format. Use `YYYY-MM-DD HH:MM`.", flags: MessageFlags.Ephemeral }); return; }
+            if (endsAt <= eventAt!) { await interaction.reply({ content: "❌ end_date must be after the event start date.", flags: MessageFlags.Ephemeral }); return; }
+          }
+
           await interaction.deferReply();
           const ev = await createEvent({
             guildId:    gid,
             channelId:  ch.id,
             title,
             description: desc,
-            eventAt,
+            eventAt: eventAt!,
             createdBy:  interaction.user.id,
             pingRoleId: role?.id ?? null,
             bannerUrl:  banner,
             type,
             recurring,
+            endsAt,
           });
 
           const embed = buildEventEmbed(ev, true);
@@ -3112,7 +3123,8 @@ function handleInteractions(client: Client): void {
           const newCh      = interaction.options.getChannel("channel") as TextChannel | null;
           const newRole    = interaction.options.getRole("role");
           const newType    = (interaction.options.getString("type")      ?? undefined) as EventType | undefined;
-          const newRecur   = (interaction.options.getString("recurring") ?? undefined) as RecurType | undefined;
+          const newRecur      = (interaction.options.getString("recurring") ?? undefined) as RecurType | undefined;
+          const newEndDateStr = interaction.options.getString("end_date") ?? undefined;
 
           let newEventAt: Date | undefined;
           if (newDtStr) {
@@ -3121,7 +3133,13 @@ function handleInteractions(client: Client): void {
             if (newEventAt.getTime() < Date.now()) { await interaction.reply({ content: "❌ New date must be in the future.", flags: MessageFlags.Ephemeral }); return; }
           }
 
-          const hasChanges = newTitle || newDesc !== null || newEventAt || newCh || newRole !== null || newType || newRecur;
+          let newEndsAt: Date | null | undefined;
+          if (newEndDateStr !== undefined) {
+            newEndsAt = parseEventDate(newEndDateStr);
+            if (!newEndsAt) { await interaction.reply({ content: "❌ Invalid end_date format. Use `YYYY-MM-DD HH:MM`.", flags: MessageFlags.Ephemeral }); return; }
+          }
+
+          const hasChanges = newTitle || newDesc !== null || newEventAt || newCh || newRole !== null || newType || newRecur || newEndDateStr !== undefined;
           if (!hasChanges) { await interaction.reply({ content: "⚠️ No changes provided.", flags: MessageFlags.Ephemeral }); return; }
 
           await interaction.deferReply();
@@ -3133,6 +3151,7 @@ function handleInteractions(client: Client): void {
             pingRoleId:  newRole ? newRole.id : undefined,
             type:        newType,
             recurring:   newRecur,
+            endsAt:      newEndsAt,
           });
 
           if (!updated) { await interaction.editReply("❌ Failed to update event."); return; }
