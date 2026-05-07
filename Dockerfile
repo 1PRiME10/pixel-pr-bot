@@ -1,29 +1,30 @@
 FROM node:24-alpine
 
-# Native module build tools + ffmpeg
+# Native build tools + ffmpeg for voice features
 RUN apk add --no-cache python3 make g++ git ffmpeg
 
-# Enable pnpm via corepack
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# Enable pnpm (lockfile v9 → needs pnpm v9+)
+RUN corepack enable && corepack prepare pnpm@9 --activate
 
 WORKDIR /app
 
-# ── Copy workspace config (layer cache: only reinstall when these change) ──
+# ── Copy workspace manifests first (layer cache: reinstall only when these change) ──
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
 COPY tsconfig.base.json tsconfig.json ./
 
-# ── Copy all workspace packages ───────────────────────────────────────────
-COPY lib/ ./lib/
-COPY scripts/ ./scripts/
-COPY artifacts/api-server/ ./artifacts/api-server/
+# ── Copy ALL workspace packages (pnpm needs the full workspace graph) ────────
+COPY lib/                        ./lib/
+COPY scripts/                    ./scripts/
+COPY artifacts/api-server/       ./artifacts/api-server/
+COPY artifacts/mockup-sandbox/   ./artifacts/mockup-sandbox/
 
-# ── Install all workspace deps ────────────────────────────────────────────
-RUN pnpm install --frozen-lockfile
+# ── Install all workspace deps ────────────────────────────────────────────────
+RUN pnpm install --frozen-lockfile --ignore-scripts=false
 
-# ── Build the api-server (runs build.mjs → dist/index.mjs) ───────────────
+# ── Build only the api-server ─────────────────────────────────────────────────
 RUN pnpm --filter @workspace/api-server run build
 
-# ── Runtime ───────────────────────────────────────────────────────────────
+# ── Runtime ───────────────────────────────────────────────────────────────────
 WORKDIR /app/artifacts/api-server
 ENV NODE_ENV=production
 
