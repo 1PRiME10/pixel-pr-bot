@@ -1,14 +1,16 @@
-FROM node:24-alpine
+FROM node:24-slim
 
 # Native build tools + ffmpeg for voice features
-RUN apk add --no-cache python3 make g++ git ffmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 make g++ git ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 
-# Enable pnpm (lockfile v9 → needs pnpm v9+)
+# Enable pnpm (match exact version used to generate lockfile)
 RUN corepack enable && corepack prepare pnpm@10.26.1 --activate
 
 WORKDIR /app
 
-# ── Copy workspace manifests first (layer cache: reinstall only when these change) ──
+# ── Copy workspace manifests first (layer cache) ──────────────────────────────
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
 COPY tsconfig.base.json tsconfig.json ./
 
