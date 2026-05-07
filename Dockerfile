@@ -4,7 +4,7 @@ FROM node:24-alpine
 RUN apk add --no-cache python3 make g++ git ffmpeg
 
 # Enable pnpm (lockfile v9 → needs pnpm v9+)
-RUN corepack enable && corepack prepare pnpm@9 --activate
+RUN corepack enable && corepack prepare pnpm@10.26.1 --activate
 
 WORKDIR /app
 
@@ -19,7 +19,7 @@ COPY artifacts/api-server/       ./artifacts/api-server/
 COPY artifacts/mockup-sandbox/   ./artifacts/mockup-sandbox/
 
 # ── Install all workspace deps ────────────────────────────────────────────────
-RUN pnpm install --no-frozen-lockfile --ignore-scripts=false
+RUN pnpm install --frozen-lockfile --ignore-scripts=false
 
 # ── Build only the api-server ─────────────────────────────────────────────────
 RUN pnpm --filter @workspace/api-server run build
