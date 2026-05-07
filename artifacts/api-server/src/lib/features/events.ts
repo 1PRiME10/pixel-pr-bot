@@ -9,6 +9,7 @@
 //   • At start (with ping)
 //
 // Recurring options: daily | weekly | monthly | none
+// ends_at: optional date to stop recurring after
 
 import {
   Client,
@@ -34,6 +35,7 @@ export interface BotEvent {
   banner_url:     string | null;
   type:           EventType;
   recurring:      RecurType;
+  ends_at:        Date | null;
   reminded_24h:   boolean;
   reminded_1h:    boolean;
   reminded_10m:   boolean;
@@ -78,6 +80,7 @@ async function initDB(): Promise<void> {
       banner_url      TEXT,
       type            TEXT NOT NULL DEFAULT 'event',
       recurring       TEXT NOT NULL DEFAULT 'none',
+      ends_at         TIMESTAMPTZ,
       reminded_24h    BOOLEAN NOT NULL DEFAULT FALSE,
       reminded_1h     BOOLEAN NOT NULL DEFAULT FALSE,
       reminded_10m    BOOLEAN NOT NULL DEFAULT FALSE,
@@ -86,6 +89,11 @@ async function initDB(): Promise<void> {
       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+
+  // Safe migration: add ends_at column if table already existed without it
+  await pool.query(`
+    ALTER TABLE bot_events ADD COLUMN IF NOT EXISTS ends_at TIMESTAMPTZ
+  `).catch(() => {});
 }
 
 // ── Public: Create event ─────────────────────────────────────────────────────
@@ -100,15 +108,17 @@ export async function createEvent(opts: {
   bannerUrl:   string | null;
   type:        EventType;
   recurring:   RecurType;
+  endsAt?:     Date | null;
 }): Promise<BotEvent> {
   const { rows } = await pool.query<BotEvent>(
     `INSERT INTO bot_events
-      (guild_id, channel_id, title, description, event_at, created_by, ping_role_id, banner_url, type, recurring)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      (guild_id, channel_id, title, description, event_at, created_by, ping_role_id, banner_url, type, recurring, ends_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
      RETURNING *`,
     [opts.guildId, opts.channelId, opts.title, opts.description,
      opts.eventAt.toISOString(), opts.createdBy, opts.pingRoleId,
-     opts.bannerUrl, opts.type, opts.recurring],
+     opts.bannerUrl, opts.type, opts.recurring,
+     opts.endsAt ? opts.endsAt.toISOString() : null],
   );
   return rows[0];
 }
@@ -152,6 +162,7 @@ export async function editEvent(id: number, guildId: string, updates: {
   pingRoleId?:  string | null;
   type?:        EventType;
   recurring?:   RecurType;
+  endsAt?:      Date | null;
 }): Promise<BotEvent | null> {
   const sets: string[] = [];
   const vals: unknown[] = [];
@@ -159,7 +170,8 @@ export async function editEvent(id: number, guildId: string, updates: {
 
   if (updates.title       !== undefined) { sets.push(`title=$${i++}`);         vals.push(updates.title); }
   if (updates.description !== undefined) { sets.push(`description=$${i++}`);   vals.push(updates.description); }
-  if (updates.eventAt     !== undefined) { sets.push(`event_at=$${i++}`);      vals.push(updates.eventAt.toISOString());
+  if (updates.eventAt     !== undefined) {
+    sets.push(`event_at=$${i++}`);      vals.push(updates.eventAt.toISOString());
     sets.push(`reminded_24h=FALSE`);
     sets.push(`reminded_1h=FALSE`);
     sets.push(`reminded_10m=FALSE`);
@@ -169,6 +181,7 @@ export async function editEvent(id: number, guildId: string, updates: {
   if (updates.pingRoleId  !== undefined) { sets.push(`ping_role_id=$${i++}`);  vals.push(updates.pingRoleId); }
   if (updates.type        !== undefined) { sets.push(`type=$${i++}`);          vals.push(updates.type); }
   if (updates.recurring   !== undefined) { sets.push(`recurring=$${i++}`);     vals.push(updates.recurring); }
+  if (updates.endsAt      !== undefined) { sets.push(`ends_at=$${i++}`);       vals.push(updates.endsAt ? updates.endsAt.toISOString() : null); }
 
   if (!sets.length) return getEvent(id, guildId);
 
@@ -207,6 +220,7 @@ function buildReminderEmbed(ev: BotEvent, level: "24h" | "1h" | "10m" | "start")
   if (ev.description) embed.addFields({ name: "📋 Description", value: ev.description, inline: false });
   if (ev.banner_url)  embed.setImage(ev.banner_url);
   if (ev.recurring !== "none") embed.addFields({ name: "🔄 Recurring", value: ev.recurring, inline: true });
+  if (ev.ends_at) embed.addFields({ name: "🛑 Ends After", value: `<t:${Math.floor(new Date(ev.ends_at).getTime()/1000)}:D>`, inline: true });
   embed.setFooter({ text: `Event ID: ${ev.id} • Created by <@${ev.created_by}>` });
 
   return embed;
@@ -239,8 +253,8 @@ async function pollReminders(): Promise<void> {
   );
 
   for (const ev of rows) {
-    const t   = ev.event_at.getTime();
-    const diff = t - now; // ms until event (negative if past)
+    const t    = ev.event_at.getTime();
+    const diff = t - now;
 
     const ch = activeClient.channels.cache.get(ev.channel_id) as TextChannel | undefined;
     if (!ch) continue;
@@ -275,13 +289,20 @@ async function pollReminders(): Promise<void> {
 
       if (ev.recurring !== "none") {
         const nextAt = nextRecurDate(ev.event_at, ev.recurring as RecurType);
-        await pool.query(
-          `UPDATE bot_events
-           SET reminded_start=TRUE, reminded_24h=FALSE, reminded_1h=FALSE,
-               reminded_10m=FALSE, reminded_start=TRUE, event_at=$2
-           WHERE id=$1`,
-          [ev.id, nextAt.toISOString()],
-        );
+        // If ends_at is set and next occurrence is after it, stop recurring
+        const expired = ev.ends_at && nextAt > new Date(ev.ends_at);
+        if (expired) {
+          await pool.query(`UPDATE bot_events SET reminded_start=TRUE, ended=TRUE WHERE id=$1`, [ev.id]);
+        } else {
+          await pool.query(
+            `UPDATE bot_events
+             SET event_at=$2,
+                 reminded_24h=FALSE, reminded_1h=FALSE,
+                 reminded_10m=FALSE, reminded_start=FALSE
+             WHERE id=$1`,
+            [ev.id, nextAt.toISOString()],
+          );
+        }
       } else {
         await pool.query(`UPDATE bot_events SET reminded_start=TRUE, ended=TRUE WHERE id=$1`, [ev.id]);
       }
@@ -308,6 +329,7 @@ export function buildEventEmbed(ev: BotEvent, showId = true): EmbedBuilder {
   if (ev.description)    embed.setDescription(ev.description);
   if (ev.ping_role_id)   embed.addFields({ name: "🔔 Ping", value: `<@&${ev.ping_role_id}>`, inline: true });
   if (ev.recurring !== "none") embed.addFields({ name: "🔄 Recurring", value: ev.recurring, inline: true });
+  if (ev.ends_at)        embed.addFields({ name: "🛑 Ends After", value: `<t:${Math.floor(new Date(ev.ends_at).getTime()/1000)}:D>`, inline: true });
   if (ev.banner_url)     embed.setImage(ev.banner_url);
   if (showId)            embed.setFooter({ text: `Event ID: ${ev.id} • Use /event delete ${ev.id} to remove` });
 
