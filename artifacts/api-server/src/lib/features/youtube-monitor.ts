@@ -310,23 +310,8 @@ async function runPollCycle(client: Client): Promise<void> {
   }
   pollRunning = true;
 
-  const lockClient = await pool.connect();
-  let gotLock = false;
-  try {
-    const res = await lockClient.query(`SELECT pg_try_advisory_lock(${LOCK_KEY}) AS locked`);
-    gotLock = res.rows[0]?.locked === true;
-  } catch {
-    lockClient.release();
-    pollRunning = false;
-    return;
-  }
-
-  if (!gotLock) {
-    console.log("[YouTube] Another instance is polling — skipping");
-    lockClient.release();
-    pollRunning = false;
-    return;
-  }
+  // Advisory locks removed — pg_advisory_lock is incompatible with Supabase transaction pooler.
+  // pollRunning flag above is sufficient for single-instance deployments.
 
   try {
     const { rows } = await pool.query(
@@ -359,8 +344,6 @@ async function runPollCycle(client: Client): Promise<void> {
       }
     }
   } finally {
-    await lockClient.query(`SELECT pg_advisory_unlock(${LOCK_KEY})`).catch(() => {});
-    lockClient.release();
     pollRunning = false;
   }
 }
