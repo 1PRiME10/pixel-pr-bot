@@ -1116,26 +1116,8 @@ async function runPollCycle(client: Client): Promise<void> {
   }
   pollRunning = true;
 
-  // Acquire a dedicated connection for the advisory lock.
-  // pg_advisory_lock is session-scoped — lock + unlock MUST use the same connection.
-  const lockClient = await pool.connect();
-  let gotLock = false;
-  try {
-    const lockRes = await lockClient.query(`SELECT pg_try_advisory_lock(987654321) AS locked`);
-    gotLock = lockRes.rows[0]?.locked === true;
-  } catch (err) {
-    console.error("[TweetMonitor] Could not acquire advisory lock:", err);
-    lockClient.release();
-    pollRunning = false;
-    return;
-  }
-
-  if (!gotLock) {
-    console.log("[TweetMonitor] Another instance is polling — skipping this tick");
-    lockClient.release();
-    pollRunning = false;
-    return;
-  }
+  // Advisory locks removed — pg_advisory_lock is incompatible with Supabase transaction pooler.
+  // pollRunning flag above is sufficient for single-instance deployments.
 
   try {
     let rows: {
