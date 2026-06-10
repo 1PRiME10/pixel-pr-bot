@@ -1218,9 +1218,6 @@ async function runPollCycle(client: Client): Promise<void> {
       }
     }
   } finally {
-    // Unlock on the SAME connection that acquired the lock, then release it back to the pool
-    await lockClient.query(`SELECT pg_advisory_unlock(987654321)`).catch(() => {});
-    lockClient.release();
     pollRunning = false;
   }
 }
