@@ -20,7 +20,8 @@ import Parser from "rss-parser";
 import { pool } from "@workspace/db";
 
 const POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes (was 5 — halves RSS fetch rate, no user impact)
-const LOCK_KEY         = 554433221;       // unique advisory lock key
+// Advisory locks removed — pg_advisory_lock is incompatible with Supabase transaction pooler.
+let tvNewsPollRunning = false;
 
 // ─── TV News Sources ──────────────────────────────────────────────────────────
 export interface TVSource {
@@ -386,10 +387,8 @@ async function postToGuilds(client: Client, items: TVItem[]): Promise<void> {
 
 // ─── Poll cycle ───────────────────────────────────────────────────────────────
 async function runPollCycle(client: Client): Promise<void> {
-  const { rows: lock } = await pool.query(
-    `SELECT pg_try_advisory_lock($1) AS acquired`, [LOCK_KEY]
-  );
-  if (!lock[0]?.acquired) return;
+  if (tvNewsPollRunning) return;
+  tvNewsPollRunning = true;
 
   try {
     const { rows: active } = await pool.query(
@@ -420,7 +419,7 @@ async function runPollCycle(client: Client): Promise<void> {
     await postToGuilds(client, fresh);
 
   } finally {
-    await pool.query(`SELECT pg_advisory_unlock($1)`, [LOCK_KEY]);
+    tvNewsPollRunning = false;
   }
 }
 
