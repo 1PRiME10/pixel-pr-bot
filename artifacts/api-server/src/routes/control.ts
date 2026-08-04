@@ -532,4 +532,214 @@ router.get("/control/users-list", requireToken, async (req: any, res: any) => {
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ─── GET /api/control/overview ────────────────────────────────────────────────
+router.get("/control/overview", requireToken, async (_req: any, res: any) => {
+  try {
+    const botClient = getClient();
+    const botStart  = getStartTime();
+    const wsPing    = botClient?.ws?.ping ?? -1;
+    const discordOnline = !!botClient?.isReady();
+    let totalServers = 0;
+    if (botClient?.isReady()) totalServers = botClient.guilds.cache.size;
+
+    let uptime = "—";
+    if (botStart) {
+      const ms = Date.now() - botStart.getTime();
+      const h  = Math.floor(ms / 3_600_000);
+      const m  = Math.floor((ms % 3_600_000) / 60_000);
+      uptime = h > 0 ? `${h}h ${m}m` : `${m}m`;
+    }
+
+    const [total, server, dm, msgs, cmds, new7, active7, kw] = await Promise.all([
+      pool.query(`SELECT COUNT(DISTINCT user_id) AS n FROM user_profiles`),
+      pool.query(`SELECT COUNT(DISTINCT user_id) AS n FROM user_profiles WHERE guild_id <> 'global'`),
+      pool.query(`SELECT COUNT(DISTINCT user_id) AS n FROM user_profiles WHERE guild_id = 'global'`),
+      pool.query(`SELECT COALESCE(SUM(msg_count),0) AS n FROM user_profiles`),
+      pool.query(`SELECT COALESCE(SUM(cmd_count),0) AS n FROM user_profiles`),
+      pool.query(`SELECT COUNT(DISTINCT user_id) AS n FROM user_profiles WHERE first_seen >= NOW() - INTERVAL '7 days'`),
+      pool.query(`SELECT COUNT(DISTINCT user_id) AS n FROM user_profiles WHERE last_seen >= NOW() - INTERVAL '7 days'`),
+      pool.query(`
+        SELECT key, CAST(SUM((value::int)) AS BIGINT) AS total_count
+        FROM user_profiles, jsonb_each_text(keywords)
+        GROUP BY key ORDER BY total_count DESC LIMIT 20
+      `).catch(() => ({ rows: [] })),
+    ]);
+
+    const topKeywords = (kw as any).rows.map((r: any) => ({
+      word: r.key, count: parseInt(r.total_count, 10),
+    }));
+
+    res.json({
+      totalUsers:    parseInt((total as any).rows[0].n, 10),
+      serverUsers:   parseInt((server as any).rows[0].n, 10),
+      dmUsers:       parseInt((dm as any).rows[0].n, 10),
+      totalMessages: parseInt((msgs as any).rows[0].n, 10),
+      totalCommands: parseInt((cmds as any).rows[0].n, 10),
+      totalServers,
+      newUsers7d:    parseInt((new7 as any).rows[0].n, 10),
+      activeUsers7d: parseInt((active7 as any).rows[0].n, 10),
+      discordOnline,
+      uptime,
+      wsPing,
+      topKeywords,
+    });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── GET /api/control/dm-users ────────────────────────────────────────────────
+router.get("/control/dm-users", requireToken, async (_req: any, res: any) => {
+  try {
+    const botClient = getClient();
+    const { rows } = await pool.query(`
+      SELECT user_id AS "userId", guild_id AS "guildId", username,
+        msg_count AS "msgCount", cmd_count AS "cmdCount",
+        first_seen AS "firstSeen", last_seen AS "lastSeen"
+      FROM user_profiles WHERE guild_id = 'global'
+      ORDER BY msg_count DESC LIMIT 100
+    `);
+    const result = [];
+    for (const r of rows) {
+      let username = r.username;
+      if (!username && botClient?.isReady()) {
+        try { username = (await botClient.users.fetch(r.userId))?.username ?? null; } catch {}
+      }
+      result.push({
+        userId: r.userId, guildId: r.guildId, guildName: "DM",
+        username: username ?? null, avatarUrl: null,
+        msgCount: r.msgCount ?? 0, cmdCount: r.cmdCount ?? 0,
+        firstSeen: r.firstSeen?.toISOString?.() ?? null,
+        lastSeen: r.lastSeen?.toISOString?.() ?? null,
+        isDm: true,
+      });
+    }
+    res.json(result);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── GET /api/control/user/:userId ────────────────────────────────────────────
+router.get("/control/user/:userId", requireToken, async (req: any, res: any) => {
+  try {
+    const userId = String(req.params.userId ?? "");
+    if (!userId) { res.status(400).json({ error: "Missing userId" }); return; }
+    const botClient = getClient();
+
+    const [profiles, memRow] = await Promise.all([
+      pool.query(`
+        SELECT user_id AS "userId", guild_id AS "guildId", username,
+          msg_count AS "msgCount", cmd_count AS "cmdCount",
+          first_seen AS "firstSeen", last_seen AS "lastSeen",
+          hour_counts AS "hourCounts"
+        FROM user_profiles WHERE user_id = $1 ORDER BY msg_count DESC
+      `, [userId]),
+      pool.query(`SELECT nickname, interests, topics, notes FROM user_memory WHERE user_id = $1 LIMIT 1`, [userId])
+        .catch(() => ({ rows: [] })),
+    ]);
+
+    if (!profiles.rows.length) { res.status(404).json({ error: "User not found" }); return; }
+
+    const totalMsgs = profiles.rows.reduce((s: number, r: any) => s + (r.msgCount ?? 0), 0);
+    const totalCmds = profiles.rows.reduce((s: number, r: any) => s + (r.cmdCount ?? 0), 0);
+    const firstSeen = profiles.rows.map((r: any) => r.firstSeen).filter(Boolean).sort()[0];
+    const lastSeen  = profiles.rows.map((r: any) => r.lastSeen).filter(Boolean).sort().reverse()[0];
+
+    const hourCounts = Array(24).fill(0);
+    for (const r of profiles.rows) {
+      const hc: number[] = r.hourCounts ?? [];
+      for (let i = 0; i < 24 && i < hc.length; i++) hourCounts[i] += hc[i] ?? 0;
+    }
+
+    let username = profiles.rows[0].username ?? null;
+    let avatarUrl: string | null = null;
+    if (botClient?.isReady()) {
+      try {
+        const u = await botClient.users.fetch(userId);
+        username = u.username;
+        avatarUrl = u.displayAvatarURL({ size: 128 });
+      } catch {}
+    }
+
+    const mem = (memRow as any).rows[0] ?? null;
+    res.json({
+      userId, username, avatarUrl, totalMsgs, totalCmds,
+      firstSeen: firstSeen ? new Date(firstSeen).toISOString() : null,
+      lastSeen:  lastSeen  ? new Date(lastSeen).toISOString()  : null,
+      hourCounts,
+      profiles: profiles.rows.map((r: any) => ({
+        userId: r.userId, guildId: r.guildId,
+        guildName: r.guildId === "global" ? "DM" : (botClient?.guilds.cache.get(r.guildId)?.name ?? null),
+        username: r.username ?? null, avatarUrl: null,
+        msgCount: r.msgCount ?? 0, cmdCount: r.cmdCount ?? 0,
+        firstSeen: r.firstSeen?.toISOString?.() ?? null,
+        lastSeen:  r.lastSeen?.toISOString?.()  ?? null,
+        isDm: r.guildId === "global",
+      })),
+      memory: { nickname: mem?.nickname ?? null, interests: mem?.interests ?? [], topics: mem?.topics ?? [], notes: mem?.notes ?? null },
+    });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── GET /api/control/server/:guildId ─────────────────────────────────────────
+router.get("/control/server/:guildId", requireToken, async (req: any, res: any) => {
+  try {
+    const guildId = String(req.params.guildId ?? "");
+    if (!guildId) { res.status(400).json({ error: "Missing guildId" }); return; }
+    const botClient = getClient();
+    const guild = botClient?.guilds.cache.get(guildId);
+
+    const [stats, topUsers] = await Promise.all([
+      pool.query(`
+        SELECT COALESCE(SUM(msg_count),0)::int AS "totalMsgs",
+          COALESCE(SUM(cmd_count),0)::int AS "totalCmds",
+          COUNT(DISTINCT user_id)::int AS "activeUsers"
+        FROM user_profiles WHERE guild_id = $1
+      `, [guildId]),
+      pool.query(`
+        SELECT user_id AS "userId", guild_id AS "guildId", username,
+          msg_count AS "msgCount", cmd_count AS "cmdCount", last_seen AS "lastSeen"
+        FROM user_profiles WHERE guild_id = $1
+        ORDER BY msg_count DESC LIMIT 20
+      `, [guildId]),
+    ]);
+
+    if (!stats.rows.length) { res.status(404).json({ error: "Server not found" }); return; }
+
+    const activeFeatures = FEATURE_REGISTRY.filter(f => isFeatureEnabled(f.key)).map(f => f.name);
+
+    res.json({
+      id: guildId, name: guild?.name ?? guildId,
+      memberCount: guild?.memberCount ?? 0,
+      iconUrl: guild?.iconURL({ size: 64 }) ?? null,
+      joinedAt: guild?.joinedAt?.toISOString() ?? null,
+      totalMsgs:   stats.rows[0].totalMsgs,
+      totalCmds:   stats.rows[0].totalCmds,
+      activeUsers: stats.rows[0].activeUsers,
+      activeFeatures,
+      topUsers: topUsers.rows.map((r: any) => ({
+        userId: r.userId, guildId: r.guildId,
+        guildName: guild?.name ?? null,
+        username: r.username ?? null, avatarUrl: null,
+        msgCount: r.msgCount ?? 0, cmdCount: r.cmdCount ?? 0,
+        firstSeen: null, lastSeen: r.lastSeen?.toISOString?.() ?? null,
+        isDm: false,
+      })),
+    });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── GET /api/control/activity-hours ──────────────────────────────────────────
+router.get("/control/activity-hours", requireToken, async (_req: any, res: any) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT generate_series AS hour,
+        COALESCE(SUM(hour_counts[generate_series + 1]), 0)::int AS count
+      FROM generate_series(0, 23), user_profiles
+      GROUP BY generate_series ORDER BY generate_series
+    `);
+    res.json({ hours: rows.map((r: any) => ({ hour: parseInt(r.hour, 10), count: r.count })) });
+  } catch (e: any) {
+    res.json({ hours: Array.from({ length: 24 }, (_, i) => ({ hour: i, count: 0 })) });
+  }
+});
+
 export default router;
