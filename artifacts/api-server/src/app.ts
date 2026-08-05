@@ -19,14 +19,10 @@ app.use(express.urlencoded({ extended: true }));
 // Built files live at artifacts/api-server/public/panel/ relative to repo root.
 // When bundled, __dirname = .../artifacts/api-server/dist/ → go one level up.
 const panelDir = path.join(__dirname, "..", "public", "panel");
-app.use("/panel", express.static(panelDir, { index: false }));
-// SPA fallback: any /panel/* that isn't a file → serve index.html
-app.get("/panel/*splat", (_req, res) => {
+app.use("/panel", express.static(panelDir));
+app.use("/panel", (_req, res) => {
   res.sendFile(path.join(panelDir, "index.html"));
 });
-// bare /panel → redirect to /panel/
-app.get("/panel", (_req, res) => res.redirect(301, "/panel/"));
-
 // Redirect old dashboard URLs → new control panel
 app.get("/api/dashboard",       (_req, res) => res.redirect(301, "/panel/"));
 app.get("/api/dashboard/*splat", (_req, res) => res.redirect(301, "/panel/"));
